@@ -196,9 +196,26 @@ def compute(changed: dict, kc: KnowledgeClient | None = None, rs: RepoSource | N
                     f"{_short(c.get('fqn'))} in {c.get('git_repo')} calls {_short(c.get('target_fqn'))}, which transitively reaches changed code",
                     callerFqn=c.get("fqn"), targetFqn=c.get("target_fqn"), transitive=True)
 
-    reach_short = {_short(f) for f in (changed_fqns + closure)}
+    direct_short = {_short(f) for f in changed_fqns}
+    reach_short = direct_short | {_short(f) for f in closure}
     changed_eps = {(e["method"].upper(), e["path"]) for e in changed.get("changedApiEndpoints", [])}
     changed_ep_paths = {p for _, p in changed_eps}
+
+    # §1 "Exposed via": the endpoints the changed code is reachable from. Story 2 only
+    # sees endpoints whose own source changed; the transitive walk is what reveals that
+    # an untouched endpoint now reaches modified code.
+    exposed: dict[tuple[str, str], dict] = {}
+
+    def _note_exposed(method: str, path: str, op: str | None, tgt: str) -> None:
+        key = ((method or "").upper(), path or "")
+        if not key[1] or key in exposed:
+            return
+        exposed[key] = {
+            "method": key[0], "path": key[1], "operationId": op,
+            "targetMethod": tgt,
+            "reachedVia": "direct" if tgt in direct_short else "transitive",
+            "source": "story3",
+        }
 
     # ---- 6 (+4b). OpenAPI inbound chains --------------------------------
     try:
@@ -210,6 +227,8 @@ def compute(changed: dict, kc: KnowledgeClient | None = None, rs: RepoSource | N
         tgt = f"{ch.get('targetClass')}.{ch.get('targetMethod')}"
         api = f"{ch.get('apiMethod')} {ch.get('apiPath')} ({ch.get('apiOperationId')})"
         matched = tgt in reach_short or (ch.get("apiMethod", "").upper(), ch.get("apiPath")) in changed_eps or ch.get("apiPath") in changed_ep_paths
+        if matched:
+            _note_exposed(ch.get("apiMethod"), ch.get("apiPath"), ch.get("apiOperationId"), tgt)
         if not ch.get("callerRepo"):
             out["unmappedApiCallers"].append({"apps": ch.get("callerAppNames"), "api": api, "matchedChangedCode": matched})
             continue
@@ -258,6 +277,7 @@ def compute(changed: dict, kc: KnowledgeClient | None = None, rs: RepoSource | N
             f"No existing code symbols or endpoints changed (non-code or additive-only change). "
             f"{len(out['contextRepos'])} repo-level consumers listed in contextRepos for awareness only — not treated as impacted.")
     out["impactedRepos"] = impacted
+    out["exposedVia"] = sorted(exposed.values(), key=lambda e: (e["path"], e["method"]))
     out["ignoredRepos"] = sorted(acc.ignored)
     out["toolCalls"] = len(kc.calls)
     return validate_blast_radius(out)

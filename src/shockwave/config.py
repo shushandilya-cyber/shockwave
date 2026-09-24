@@ -43,6 +43,9 @@ class Config:
     # test runner
     test_timeout_seconds: int = int(os.getenv("SHOCKWAVE_TEST_TIMEOUT", "600"))
     test_concurrency: int = int(os.getenv("SHOCKWAVE_TEST_CONCURRENCY", "4"))
+    # Run only the test classes that mention the changed service (Maven -Dtest=...).
+    # Off by default: it trades coverage for relevance and speed, so it must be a choice.
+    targeted_tests: bool = os.getenv("SHOCKWAVE_TARGETED_TESTS", "") not in ("", "0", "false")
     # jira
     jira_triage_project: str = os.getenv("SHOCKWAVE_JIRA_TRIAGE_PROJECT", "")
     jira_mapping_file: Path = Path(os.getenv("SHOCKWAVE_JIRA_MAPPING", str(Path(__file__).resolve().parents[2] / "jira-team-mapping.yaml")))

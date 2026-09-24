@@ -12,16 +12,18 @@ def tr(status, live, **kw):
 
 
 @pytest.mark.parametrize("status,live,verdict,rule", [
+    # §3 updated rule numbers: MOCKED added as rule 4; others shifted by 1
     ("FAIL", True, "Impacted", 2),
     ("PASS", True, "NotImpacted", 3),
-    ("FAIL", False, "NeedsReview", 4),
-    ("ERROR", False, "NeedsReview", 4),
-    ("SKIPPED", False, "NeedsReview", 5),
-    ("PASS", False, "NeedsReview", 6),
+    # rule 4 is now PASS+MOCKED; FAIL/ERROR without live is rule 5
+    ("FAIL", False, "NeedsReview", 5),
+    ("ERROR", False, "NeedsReview", 5),
+    ("SKIPPED", False, "NeedsReview", 6),
+    ("PASS", False, "NeedsReview", 7),
 ])
 def test_decision_table(status, live, verdict, rule):
     v = aggregate(BR, [tr(status, live, reason="no runner")])[0]
-    assert (v["verdict"], v["rule"]) == (verdict, rule)
+    assert (v["verdict"], v["rule"]) == (verdict, rule), f"got rule {v['rule']}: {v['reasoning']}"
     assert "confidence=low" in v["reasoning"] or verdict == "NotImpacted"
 
 

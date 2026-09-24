@@ -94,16 +94,42 @@ def detect_build(rs: RepoSource, org: str, repo: str) -> tuple[str, str | None, 
     return "unknown", None, "no pom.xml / build.gradle / package.json at repo root"
 
 
+def _source_entry(blast: dict) -> dict | None:
+    """The changed repo itself, as a manifest entry.
+
+    Story 3 only looks downstream, so without this the repo that actually changed is the
+    one repo whose tests never run. Two of the five backtested incidents (INC-004,
+    INC-005) were exactly that: the culprit broke itself and was reverted, and a
+    downstream-only blast radius could not have said anything.
+    """
+    src = blast.get("sourceRepo")
+    if not src or "/" not in src:
+        return None
+    org, repo = src.split("/", 1)
+    return {
+        "org": org, "repo": repo, "confidence": "high", "isSourceRepo": True,
+        "evidence": [{"source": "changeEvent", "detail": "the change was made in this repo",
+                      "matchedChangedCode": True}],
+    }
+
+
 def resolve(blast: dict, rs: RepoSource | None = None, cfg: Config = CONFIG) -> dict:
     rs = rs or RepoSource(cfg)
     entries = []
-    for r in blast.get("impactedRepos", []):
+    targets = list(blast.get("impactedRepos", []))
+    src_entry = _source_entry(blast)
+    if src_entry and not any(
+        f"{r['org']}/{r['repo']}".lower() == f"{src_entry['org']}/{src_entry['repo']}".lower()
+        for r in targets
+    ):
+        targets.insert(0, src_entry)
+    for r in targets:
         org, repo = r["org"], r["repo"]
         avail = rs.available(org, repo)
         ev_paths = [f for e in r.get("evidence", []) for f in (e.get("files") or [])]
         e = {"org": org, "repo": repo, "confidence": r["confidence"], "team": None, "teamSource": "unassigned",
              "owners": [], "buildTool": "unknown", "testCommand": None, "runnable": False, "defaultBranch": None,
-             "notRunnableReason": None, "repoAccess": avail}
+             "notRunnableReason": None, "repoAccess": avail, "isSourceRepo": bool(r.get("isSourceRepo"))}
         if avail == "none":
             e["notRunnableReason"] = "repo not cloned locally and GitHub API unavailable — cannot inspect CODEOWNERS/build"
             entries.append(e)

@@ -3,6 +3,10 @@
 Local-first: uses a local clone (``~/Documents/projects``) or a blob-less cache clone,
 fetches the commit if missing, diffs against the first parent (or PR merge-base),
 and maps hunks to Java class/method/field declarations + REST endpoints.
+
+§1 extension: calls s2_changes_summary.classify_changes() to add a ``changesSummary``
+block to the output.  This is deterministic (no LLM) except for the single ``intent``
+sentence which is derived from the commit message.
 """
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from ..clients.repos import RepoSource, git
 from ..config import CONFIG, Config
 from ..contracts import validate_changed_symbols
 from .. import javaparse
+from .s2_changes_summary import classify_changes
 
 SOURCE_EXT = {".java", ".ts", ".js", ".py", ".go", ".kt"}
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -189,11 +194,27 @@ def extract(event: dict, rs: RepoSource | None = None, cfg: Config = CONFIG, inc
     if len(symbols) > cfg.max_symbols:
         notes.append(f"{len(symbols)} symbols changed; truncated to {cfg.max_symbols} (methods first)")
         symbols = sorted(symbols, key=lambda s: {"method": 0, "field": 1, "class": 2}[s["kind"]])[:cfg.max_symbols]
-    return validate_changed_symbols({
+
+    # §1: build changesSummary before validate so the full symbol list is available
+    # Commit message: read from git log (first line of the subject)
+    try:
+        commit_msg = git(gitdir, "log", "-1", "--pretty=%B", commit).strip()
+    except Exception:
+        commit_msg = None
+
+    out = {
         "org": org, "repo": repo, "commit": commit, "parent": parent, "branch": event.get("branch"),
         "changedFiles": changed_files,
         "changedSymbols": symbols,
         "changedApiEndpoints": eps,
         "notes": notes,
-    })
+    }
+    # classify_changes never raises — if it fails we attach the error as a note
+    try:
+        out["changesSummary"] = classify_changes(out, commit_msg)
+    except Exception as exc:
+        notes.append(f"changesSummary classification failed: {exc}")
+        out["notes"] = notes
+
+    return validate_changed_symbols(out)
 

@@ -15,7 +15,10 @@ from .clients.knowledge import KnowledgeClient
 from .clients.repos import RepoSource
 from .config import CONFIG, Config
 from .report import render_run
-from .stories import s1_trigger, s2_diff, s3_blast_radius, s4_resolve, s5_runner, s6_verdict, s7_jira
+from .stories import (
+    s1_trigger, s2_changes_summary, s2_diff, s3_blast_radius,
+    s4_resolve, s5_runner, s6_verdict, s7_jira,
+)
 
 
 def _w(d: Path, name: str, obj):
@@ -45,6 +48,12 @@ def run(org: str, repo: str, commit: str, branch: str = "staging", pr: str | Non
     _w(d, "02-changed-symbols.json", cs)
     br = step("3-blast", lambda: s3_blast_radius.compute(cs, kc, rs, cfg, local_scan=local_scan))
     _w(d, "03-blast-radius.json", br)
+    # §1: "Exposed via" needs Story 3's reachability walk, so the Story 2 artifact is
+    # rewritten once the blast radius is known. Re-running Story 2 alone is still valid;
+    # it just yields the narrower directly-changed-endpoint view.
+    if cs.get("changesSummary"):
+        s2_changes_summary.enrich_exposed_via(cs["changesSummary"], br)
+        _w(d, "02-changed-symbols.json", cs)
     _w(d, "03-tool-calls.json", kc.calls)
 
     stop_reason = None
@@ -61,8 +70,12 @@ def run(org: str, repo: str, commit: str, branch: str = "staging", pr: str | Non
             keep = {r.lower() for r in only_repos}
             man["entries"] = [e for e in man["entries"] if f"{e['org']}/{e['repo']}".lower() in keep]
         trs = step("5-tests", lambda: s5_runner.run_many(man["entries"], br.get("sourceApps", []), cfg,
-                                                         skip="test execution disabled for this run (--skip-tests)" if skip_tests else None))
-        verdicts = step("6-verdict", lambda: s6_verdict.aggregate(br, trs, man))
+                                                         skip="test execution disabled for this run (--skip-tests)" if skip_tests else None,
+                                                         source_repo=br.get("sourceRepo")))
+        # §2: pass changesSummary on the blast dict so aggregate() can use the risk class
+        # for the priority matrix. This avoids renaming blast fields.
+        br_with_summary = {**br, "changesSummary": cs.get("changesSummary")}
+        verdicts = step("6-verdict", lambda: s6_verdict.aggregate(br_with_summary, trs, man))
         if only_repos and not br["notIndexed"]:
             keep = {r.lower() for r in only_repos}
             verdicts = [v for v in verdicts if f"{v['org']}/{v['repo']}".lower() in keep]

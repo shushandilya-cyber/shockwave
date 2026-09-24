@@ -9,6 +9,7 @@
   shockwave jira      --in verdicts.json --blast blast_radius.json [--event change_event.json] [--create]
   shockwave run       --org O --repo R --commit SHA [--branch B] [--skip-tests] [--create-jira]
   shockwave report    --run-dir runs/<id>
+  shockwave backtest  --incidents incidents.yaml [--run-dir-root runs/backtest] [--write-docs]
 """
 from __future__ import annotations
 
@@ -56,6 +57,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--skip-tests", action="store_true"); p.add_argument("--create-jira", action="store_true")
     p.add_argument("--no-local-scan", action="store_true"); p.add_argument("--only-repo", action="append")
     add("report", "run-dir")
+    p = sub.add_parser("backtest")
+    p.add_argument("--incidents", default="incidents.yaml")
+    p.add_argument("--run-dir-root", default="runs/backtest")
+    p.add_argument("--write-docs", action="store_true", default=True)
+    p.add_argument("--no-write-docs", dest="write_docs", action="store_false")
+    # Tests are skipped by default: replaying every incident's full suite needs a build
+    # toolchain per repo. The live signal is still computed statically (see s5_runner).
+    p.add_argument("--skip-tests", action="store_true", default=True)
+    p.add_argument("--run-tests", dest="skip_tests", action="store_false")
+    p.add_argument("--out")
 
     a = ap.parse_args(argv)
     from .contracts import ContractError
@@ -81,7 +92,8 @@ def main(argv: list[str] | None = None) -> int:
                 entries = [e for e in entries if f"{e['org']}/{e['repo']}".lower() == a.repo.lower()]
             blast = _load(a.blast)
             apps = (a.source_apps.split(",") if a.source_apps else None) or (blast or {}).get("sourceApps") or []
-            _emit(run_many(entries, source_apps=apps), a.out)
+            _emit(run_many(entries, source_apps=apps,
+                           source_repo=(blast or {}).get("sourceRepo") or m.get("sourceRepo")), a.out)
         elif a.cmd == "verdict":
             from .stories.s6_verdict import aggregate
             _emit(aggregate(_load(a.blast), _load(a.tests), _load(a.manifest)), a.out)
@@ -98,6 +110,15 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "report":
             from .report import render_run
             print(render_run(Path(a.run_dir)))
+        elif a.cmd == "backtest":
+            from .stories.backtest import run_backtest
+            summary = run_backtest(
+                Path(a.incidents),
+                run_dir_root=Path(a.run_dir_root),
+                skip_tests=a.skip_tests,
+                write_docs=a.write_docs,
+            )
+            _emit(summary, a.out)
     except ContractError as e:
         print(f"CONTRACT ERROR: {e}", file=sys.stderr)
         return 2

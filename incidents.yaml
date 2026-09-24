@@ -1,0 +1,184 @@
+# shockwave backtest incident database — PUDO / pickup / waypoint (legacy PUDO first)
+#
+# Schema:
+#   id:              unique identifier (e.g. INC-001)
+#   jira:            Jira ticket key (bug/incident)
+#   date:            date the incident was first observed (YYYY-MM-DD)
+#   title:           short description
+#   culprit_repo:    org/repo that produced the breaking change
+#   culprit_commit:  SHA of the change that CAUSED the incident (not the fix)
+#   culprit_branch:  branch at the culprit commit (default: main)
+#   victim_repos:    list of org/repo that were impacted (experienced failures or degradation)
+#   victims_verified: true  = each victim repo is confirmed to call the culprit, with evidence
+#                     false = the victim list is from an incident narrative that we could NOT
+#                             corroborate from code or Jira. Scored separately: measuring recall
+#                             against an unverified victim list tells you nothing about the tool.
+#   verification:    how the victim list was checked, and what was found
+#   symptom:         what callers saw (500s, NPE, wrong results, timeout, …)
+#   expected_risk_class: BREAKING | BEHAVIORAL | SAFE — what §1 should classify this as
+#   detection_time:  how long from deploy to incident detection (e.g. "4h", "same-day")
+#   fix_commit:      SHA of the fix or revert commit
+#   notes:           free-text notes; unknown fields are marked "unknown"
+
+incidents:
+
+  - id: INC-001
+    jira: SHIPLLP-367
+    date: "2026-05-06"
+    title: "WQL dynamic routing regression — UNRECOGNIZABLE_ATTRIBUTE_FOUND_IN_WQL"
+    culprit_repo: CoreShipping/waypointservice
+    # 43534a26 = "SHIPLLP-323: WQL Dynamic Routing changes" introduced the V1/V2 routing bug
+    # that caused downstream eIS consumers to receive UNRECOGNIZABLE_ATTRIBUTE_FOUND_IN_WQL
+    culprit_commit: "43534a26"
+    culprit_branch: main
+    victim_repos:
+      - Ship-AST/PickupEligibilityService    # eIS dynamic routing consumer (VOODOO-10426)
+      - Ship-AST/PUDO                        # liquidation WQL consumer (Raptor2Migration)
+    victims_verified: false
+    verification: >
+      NOT CORROBORATED. Checked 2026-09-24: `git grep -i waypoint` across every remote
+      branch of Ship-AST/PUDO and Ship-AST/PickupEligibilityService returns zero hits, so
+      neither repo references the culprit service anywhere in code or config. Jira could
+      not be consulted (jirap returned HTTP 401 "Login Required" for SHIPLLP-367 and
+      VOODOO-10426 with the configured PAT).
+      Two readings are still open: (a) the victim list describes business flows affected
+      downstream rather than repos that call waypointservice, or (b) the call is made
+      through a runtime/service-discovery path that is invisible to code search.
+      Until a human confirms, recall for this incident is reported separately and must NOT
+      be read as a measure of the tool's detection quality.
+    symptom: >
+      Waypoint returned error UNRECOGNIZABLE_ATTRIBUTE_FOUND_IN_WQL (ID: 393005) for
+      liquidation WQL queries. eIS dynamic routing (VOODOO-10426) was blocked.
+      WQL variable validation skipped for V2 queries broke V1 fallback path.
+    # Corrected from BEHAVIORAL after reading the diff: 43534a26 changes the signature of
+    # V1CapabilityMigrationService#queryV1CapabilitiesAndConvertToV25 and
+    # DbHandler#getHubsForV2Query from Map<String,String> to Map<String,Object>. That is a
+    # source-incompatible change, so BREAKING is the correct class and the tool was right.
+    expected_risk_class: BREAKING
+    detection_time: "same-day"
+    fix_commit: "56280f0a"
+    notes: >
+      PUDO/Raptor2Migration is NOT indexed in Code Knowledge — shockwave will show UNKNOWN
+      for PUDO coverage. This is the key gap to fix.
+      PickupEligibilityService is indexed; the direct caller chain via WaypointClient should
+      produce High confidence.
+
+  - id: INC-002
+    jira: SHIPLLP-367
+    date: "2026-05-14"
+    title: "Hubs.json bad config — new INSPECTION_FOR_LIQUIDATION attributes caused WQL errors"
+    culprit_repo: CoreShipping/waypointservice
+    # 7eafebca = "Add eCom Global hubs with INSPECTION_FOR_LIQUIDATION capabilities"
+    # This config-only commit added a hub attribute not known to the WQL engine,
+    # causing UNRECOGNIZABLE_ATTRIBUTE_FOUND_IN_WQL on affected queries.
+    culprit_commit: "7eafebca"
+    culprit_branch: main
+    victim_repos:
+      - Ship-AST/PickupEligibilityService
+      - Ship-AST/PUDO
+    victims_verified: false
+    verification: >
+      NOT CORROBORATED — same evidence and same caveat as INC-001 (no waypoint reference
+      in either repo on any branch; Jira 401). Scored separately.
+    symptom: >
+      Hubs.json update added INSPECTION_FOR_LIQUIDATION capability attribute to eCom hubs.
+      WQL engine did not recognise the attribute → 4xx on queries using liquidation corridors.
+      Reverted in 9f7c715f.
+    expected_risk_class: BEHAVIORAL
+    detection_time: "unknown"
+    fix_commit: "9f7c715f"
+    notes: >
+      CONFIG-ONLY incident: no code symbols changed, only Hubs.json.
+      This drove the §1 fix: data under src/main/resources is served to callers, so a
+      change there is BEHAVIORAL, not SAFE. Test fixtures under src/test/resources in the
+      same commit stay SAFE. Still open: linking a specific new hub attribute to the WQL
+      consumers of that attribute, which would raise this from BEHAVIORAL to a named
+      consumer list.
+
+  - id: INC-003
+    jira: SHIPLLP-503
+    date: "2026-07-02"
+    title: "locnapi date-range explosion causes waypointservice availability drop"
+    culprit_repo: CoreShipping/locnapi
+    # No single "culprit commit" for this incident — the bug was a missing validation that
+    # always existed. The incident was triggered by a specific seller's data (10-year override).
+    culprit_commit: "unknown"
+    culprit_branch: main
+    victim_repos:
+      - CoreShipping/waypointservice      # POST /waypoint/v2/hub-capabilities timed out / Broken pipe
+    victims_verified: true
+    verification: >
+      CoreShipping/locnapi calls waypointservice over HTTP; the victim is named by the
+      PagerDuty alert and the endpoint in the symptom. Not backtestable regardless,
+      because there is no culprit commit (see culprit_commit).
+    symptom: >
+      locnapi's WaypointLocationDtoMapper.mapSpecialHoursFromFC() expanded a 10-year date
+      range into ~365,000 per-day entries, producing a 1 MB+ request body to waypointservice.
+      Monstor insert took 430 ms; locnapi timed out → Broken pipe → 5xx availability drop
+      on POST /waypoint/v2/hub-capabilities. DB write succeeded (data-integrity ok).
+    expected_risk_class: BEHAVIORAL
+    detection_time: "< 1h (PagerDuty alert Q25OKE41FTMOVN)"
+    fix_commit: unknown
+    notes: >
+      culprit_commit is unknown because the bug was a pre-existing missing validation,
+      triggered by specific seller data rather than a new commit. Backtest will skip this.
+      Key value: demonstrates that blast-radius from locnapi → waypointservice requires
+      host-based consumer detection (not FQN edges), because locnapi calls waypointservice
+      via HTTP at POST /waypoint/v2/hub-capabilities.
+      shockwave should find waypointservice as High if the OpenAPI chain is correctly linked.
+
+  - id: INC-004
+    jira: VOODOO-7377
+    date: "2024-06-21"
+    title: "PickUpSvc RaptorIO migration — orchestrator memory leak and NPE"
+    culprit_repo: Ship-AST/PickUpSvc
+    culprit_commit: "2b3c9ca"
+    culprit_branch: main
+    victim_repos:
+      - Ship-AST/PickUpSvc     # self-impact: OOM and NPE in the migrated service
+    victims_verified: true
+    verification: >
+      Self-impact, verified from git history alone: commit 2b3c9ca (#399) was reverted by
+      2924338 (#406) in the same repo 17 days later. Culprit and victim are the same repo,
+      which no downstream blast radius can find by construction.
+    symptom: >
+      RaptorIO migration introduced an orchestrator memory leak (VOODOO-7377).
+      Also triggered an NPE (PR #401), leading to two reverts (#404, #406) within
+      17 days. The migration was later re-applied with the leak fixed (#417).
+    expected_risk_class: BREAKING
+    detection_time: "< 1 week (multiple reverts)"
+    fix_commit: "2924338"
+    notes: >
+      This is a self-impact incident (the culprit and victim are the same repo).
+      Blast radius tool would not help here for cross-service impact, but changesSummary
+      should correctly classify a framework migration as BREAKING.
+      Downstream consumers (PostOrderPlanProcessingService, etc.) were indirectly affected
+      by PickUpSvc instability but are not listed as victims here because no Jira evidence
+      confirms it.
+
+  - id: INC-005
+    jira: VOODOO-10244
+    date: "2026-03-11"
+    title: "PickupEligibilityService deletes deprecated Sale flags rules — revert same day"
+    culprit_repo: Ship-AST/PickupEligibilityService
+    culprit_commit: "436607a9"
+    culprit_branch: main
+    victim_repos:
+      - Ship-AST/PickupEligibilityService    # rules relied on by downstream listings
+    victims_verified: true
+    verification: >
+      Self-impact, verified from git history alone: commit 436607a9 (#314) was reverted by
+      38bd41a4 (#318) in the same repo on the same day.
+    symptom: >
+      Deleted rules that depended on deprecated Sale flags caused eligibility evaluation
+      to produce wrong results for affected listings. Reverted the same day (38bd41a4).
+    expected_risk_class: BREAKING
+    detection_time: "same-day (revert within hours)"
+    fix_commit: "38bd41a4"
+    notes: >
+      Self-impact case (culprit = victim). The rules removed were exposed via the
+      ListingEligibilityTask path, which calls PickupEligibilityService APIs.
+      Consumers of those APIs (PUDO, PostOrderPlanProcessingService) could also be affected
+      but are not confirmed victims.
+      changesSummary should classify the rule deletion as BREAKING (removed logic in
+      exposed path).
