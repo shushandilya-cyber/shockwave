@@ -1,0 +1,23 @@
+# GitHub team (from CODEOWNERS) or repo -> Jira project/component.
+# Repo entries win over team entries. Unmapped verdicts go to `default`.
+# Keep project keys pointed at a THROWAWAY project until Story 7 is validated.
+
+default:
+  project: ""            # e.g. a shared triage project key; empty = skip creation (dry-run still renders)
+  component: unassigned
+
+teams:
+  CoreShipping/shipping-orbital:
+    project: ""          # fill in, e.g. SHIPLLP
+    component: ""
+  # example:
+  # Shipment-Tracking/tracking-core:
+  #   project: TRK
+  #   component: tracking
+
+repos: {}
+  # CoreShipping/LocBridge:
+  #   project: POODLE
+  #   component: locbridge
+  #   assignee: someuser
+

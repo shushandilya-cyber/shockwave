@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "code-mcp": {
+      "command": "/opt/homebrew/lib/node_modules/@ebay/code-mcp/.venv/bin/python",
+      "args": [
+        "/opt/homebrew/lib/node_modules/@ebay/code-mcp/code-context-mcp.py"
+      ]
+    }
+  }
+}

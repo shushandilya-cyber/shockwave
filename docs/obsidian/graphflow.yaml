@@ -1,0 +1,71 @@
+# GraphFlow definition: <team>:blast-radius-regression-triage
+# Option B (hybrid). Node "tool" = a tool on the shockwave MCP server (docs/obsidian/nodes/*.md has the node prompts).
+# Transcribe into the Obsidian Cloud Console (Staging) — field names below are descriptive, not a console export schema.
+
+name: <team>:blast-radius-regression-triage
+tags: [staging, blast-radius-triage]
+mcpServers:
+  shockwave: { url: "https://<shockwave-mcp-host>/mcp" }        # hosted shockwave-mcp --http
+  jira:      { url: "https://mcp.aigateway.vip.ebay.com/mcp/backends/jira" }   # only if Story 7 uses Jira MCP instead of create_jira_story
+  github:    { note: "optional — Story 9 PR comment" }
+
+nodes:
+  - id: trigger                      # Story 1
+    prompt: nodes/01-trigger.md
+    tool: shockwave.ingest_change_event
+    input: "{{ state }}"
+    onError: stop                    # invalid payload => fail fast, Story 2 never runs
+
+  - id: diff                         # Story 2
+    prompt: nodes/02-diff.md
+    tool: shockwave.extract_changed_symbols
+    input: { change_event: "{{ trigger.output }}" }
+
+  - id: blast-radius                 # Story 3
+    prompt: nodes/03-blast-radius.md
+    tool: shockwave.compute_blast_radius
+    input: { changed_symbols: "{{ diff.output }}" }
+    timeoutSeconds: 600
+
+  - id: gate                         # Story 8 routing rule
+    type: condition
+    when: "{{ blast-radius.output.notIndexed }} == true or len({{ blast-radius.output.impactedRepos }}) == 0"
+    then: log-and-stop               # notIndexed still gets a NeedsReview verdict via aggregate-verdict (rule 1)
+    else: resolve-repos
+
+  - id: resolve-repos                # Story 4
+    tool: shockwave.resolve_impacted_repos
+    input: { blast_radius: "{{ blast-radius.output }}" }
+
+  - id: run-tests                    # Story 5 — FAN-OUT
+    type: foreach
+    items: "{{ resolve-repos.output.entries }}"
+    concurrency: 4
+    tool: shockwave.run_downstream_tests
+    input: { manifest_entry: "{{ item }}", source_apps: "{{ blast-radius.output.sourceApps }}" }
+    timeoutSeconds: 900
+
+  - id: aggregate-verdict            # Story 6 — FAN-IN
+    waitFor: run-tests
+    tool: shockwave.aggregate_verdicts
+    input:
+      blast_radius: "{{ blast-radius.output }}"
+      test_results: "{{ run-tests.outputs }}"
+      manifest: "{{ resolve-repos.output }}"
+
+  - id: create-jira                  # Story 7 — FAN-OUT over verdict != NotImpacted
+    type: foreach
+    items: "{{ aggregate-verdict.output | where verdict != 'NotImpacted' }}"
+    prompt: nodes/07-jira.md
+    tool: shockwave.create_jira_story          # or: render_jira_story + jira MCP create_issue
+    input: { verdict: "{{ item }}", blast_radius: "{{ blast-radius.output }}", change_event: "{{ trigger.output }}" }
+
+  - id: notify                       # Story 9 (optional)
+    waitFor: create-jira
+    tool: shockwave.summarize
+    input: { verdicts: "{{ aggregate-verdict.output }}", tickets: "{{ create-jira.outputs }}",
+             source_repo: "{{ blast-radius.output.sourceRepo }}", commit: "{{ blast-radius.output.commit }}" }
+
+  - id: log-and-stop
+    type: terminal
+

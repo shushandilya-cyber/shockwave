@@ -1,0 +1,19 @@
+{
+  "teamId": "<your-obsidian-team-id>",
+  "workflowConfigs": [{ "id": "<your-team>:blast-radius-trigger" }],
+  "tags": ["staging", "auto-triggered"],
+  "eventContext": {
+    "source": "custom",
+    "target": "tess",
+    "targetSysWorkflowId": "tess-dispatch",
+    "user": "ci-bot",
+    "payload": {
+      "org": "CoreShipping",
+      "repo": "waypointservice",
+      "branch": "staging",
+      "commit": "9d60af39",
+      "environment": "staging"
+    }
+  }
+}
+
