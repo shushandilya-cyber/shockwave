@@ -10,7 +10,7 @@ available.
 | Commit | [`d19abca5`](https://github.corp.ebay.com/Ship-AST/PickupEligibilityService/commit/d19abca5ac4e7d5157a344d12cb7e835530b1858) — "[POODLE-663] add log for dual-read (#495)", qwang15, 2026-09-24 |
 | Risk class | `SAFE` (logging-only rule) |
 | Coverage | `graph+local`: Code Knowledge index `Ship-AST:PickupEligibilityService:master` plus the local index |
-| Pipeline run | [`runs/latest-master/pickupeligibility/report.md`](../../runs/latest-master/pickupeligibility/report.md) |
+| Pipeline run | [`runs/latest-master-v3/pickupeligibility/report.md`](../../runs/latest-master-v3/pickupeligibility/report.md) |
 
 ## What changed
 Four files, 93 lines added and none removed:
@@ -51,8 +51,12 @@ Also:
   that one symbol are **unknown**, not absent. Because the change is logging-only, that doesn't change the verdict.
 
 ## Test evidence
-- **Source repo at `d19abca5`:** PASS, 752 tests, including the live integration test
-  `GuestUserBuyingFlowIntegrationTest`. Verdict: NotImpacted (rule 3).
+- **Source repo at `d19abca5`:** PASS, 752 tests. Verdict: NeedsReview (rule 7).
+  - The live integration test `GuestUserBuyingFlowIntegrationTest` did **not** run. `upcsService/pom.xml` sets
+    `skipIntegrationTests=true` and only runs `**/*IntegrationTest.java` through failsafe.
+  - An earlier run counted it anyway and reported NotImpacted (rule 3). The pipeline now counts only tests that
+    executed.
+  - For a logging-only change, the unit suite passing is enough.
 - **userpreferences:** it ran at its own default branch, which can't contain a PickupEligibilityService commit, and
   the failing test is a whole-application context load. The root cause of that failure is **unknown**. The captured
   log shows only `BUILD FAILURE` in `userpreferencesService`. Treat it as a pre-existing environment issue in that

@@ -1,7 +1,8 @@
 # Latest master commit — impact reports (2026-09-25)
 
-Every claim links to a commit, a file:line, or a pipeline artifact under `runs/latest-master/<name>/`. Runs were
-read-only, with Jira in dry-run.
+Every claim links to a commit, a file:line, or a pipeline artifact. Those are under `runs/latest-master/<name>/`,
+except polis and pickupeligibility, which are under `runs/latest-master-v3/<name>/` after the live-signal fix. Runs
+were read-only, with Jira in dry-run.
 
 - **How the source repo was tested:** at the analysed commit, with a parent-commit re-run whenever tests failed.
 - **How consumers were tested:** at their default branch.
@@ -31,4 +32,8 @@ No commit on master today introduces a failure or breaks a consumer. The follow-
 
 - punotif's timezone-dependent test;
 - a startup check for pickupsvc's platform bump;
-- the mocked-only coverage of polis's new provider.
+- polis's new provider has no end-to-end test that runs under `mvn test`.
+
+The live-integration tests in polis, pickupeligibility and locnapi are all excluded from `mvn test`. Each of those
+repos has no test in its default build that exercises the service live. See the
+[backtest analysis](../backtest/five-repos-analysis.md) for what that meant for past incidents.

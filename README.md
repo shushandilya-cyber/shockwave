@@ -103,6 +103,10 @@ The live-integration signal is tri-state and is **always** computed, even when t
 - **MOCKED** — tests mock it (Mockito/WireMock); a PASS means the contract *shape* holds, not that behaviour is unchanged. Own verdict rule.
 - **NONE** — nothing references the service; the run is a generic sanity check.
 
+After a run, only test classes that actually executed count: they must appear, non-skipped, in the JUnit XML
+reports. A `*IT.java` that surefire excludes, or an `*IntegrationTest` that only failsafe runs, is listed in the note
+as "did not execute" and doesn't make the signal LIVE. Otherwise an excluded test could produce a false "NotImpacted".
+
 Dedicated integration-test repos (e.g. `Ship-AST/PudoIntegrationTests`) are discovered by scanning local clones
 for the source's staging hosts, and are **run**, not merely listed. The source repo itself is also evaluated:
 Story 3 is downstream-only, so without that the changed repo would be the one repo whose tests never run.

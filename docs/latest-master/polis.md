@@ -8,7 +8,7 @@ API-mode jobs resolve that provider. No other repo imports the enum, and the rep
 | Commit | [`ee5dd5df`](https://github.corp.ebay.com/CoreShipping/polis/commit/ee5dd5df7faf6a8873503ae4d062adb6e398bce0) — "SHIPLLP-634: Add ORANGECONNEX to LocationProvider enum (#271)", gprabhala, 2026-09-23 |
 | Risk class | `BEHAVIORAL` (new enum constant) |
 | Coverage | `local`: not registered in Code Knowledge |
-| Pipeline run | [`runs/latest-master/polis/report.md`](../../runs/latest-master/polis/report.md) |
+| Pipeline run | [`runs/latest-master-v3/polis/report.md`](../../runs/latest-master-v3/polis/report.md) |
 
 ## What changed
 In `src/main/java/com/ebay/raptor/pudo/provider/LocationProvider.java` (+3/−1), after `DPD` the enum gains
@@ -33,9 +33,10 @@ None found in the local index. Because polis isn't in Code Knowledge, repos outs
 
 ## Test evidence
 - **Source repo at `ee5dd5df`:** PASS, 112 tests, Zulu 17.
-- **Verdict:** NeedsReview (rule 4). The integration-style test `PolisApplicationIT` mocks LocBridge, so the suite
-  confirms the contract shape, not live behaviour with OrangeConnex.
+- **Verdict:** NeedsReview (rule 7). No test that ran exercises the job end to end. The only integration test,
+  `PolisApplicationIT`, is excluded from `mvn test` by the surefire config (`**/*IT.java`). Even when it does run,
+  it does nothing unless `testHost` is set. The pipeline now reports it as "did not execute", not as evidence.
 
 ## Summary
-Safe to ship. The behaviour that matters, an OrangeConnex job calling LocBridge end to end, is only covered by
-mocks. Watch the first real OrangeConnex job run.
+Safe to ship. The behaviour that matters, an OrangeConnex job calling LocBridge end to end, has no automated
+coverage at all. Watch the first real OrangeConnex job run.

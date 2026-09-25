@@ -29,10 +29,10 @@ Each incident is replayed by running the pipeline at the **culprit commit** (rea
 | ID | Title | Culprit | Victims found | Recall | Risk class | Caught | Live signal |
 |---|---|---|---|---|---|---|---|
 | INC-006 | punotif sandbox deployment failure after | `a196d8b4` | 1/1 | 100% | yes (BREAKING) | **yes** | NONE |
-| INC-007 | B2C PUDO-eligible listings down 15–20% W | `fb138960` | 1/1 | 100% | yes (BEHAVIORAL) | **NO** | LIVE |
+| INC-007 | B2C PUDO-eligible listings down 15–20% W | `fb138960` | 1/1 | 100% | yes (BEHAVIORAL) | **NO** | NONE |
 | INC-008 | PickUpSvc SWU raptor-io-parent 3.1.2→3.1 | `95c0f4b7` | 1/1 | 100% | yes (BEHAVIORAL) | **NO** | NONE |
-| INC-009 | locnapi sandbox createInventoryLocation( | `f8da817` | 1/1 | 100% | yes (BREAKING) | **yes** | LIVE |
-| INC-010 | polis fails to start after Spring Boot 3 | `dbcb94f` | 1/1 | 100% | NO (BREAKING) | **NO** | LIVE |
+| INC-009 | locnapi sandbox createInventoryLocation( | `f8da817` | 1/1 | 100% | yes (BREAKING) | **yes** | NONE |
+| INC-010 | polis fails to start after Spring Boot 3 | `dbcb94f` | 1/1 | 100% | NO (BREAKING) | **NO** | NONE |
 
 ## Per-Incident Detail
 
@@ -66,9 +66,9 @@ Each incident is replayed by running the pipeline at the **culprit commit** (rea
 - **Victims found in blast radius:**
   - `Ship-AST/PickupEligibilityService` confidence=high priority=P2
 - **Would it have been caught?** NO — needed any of `sourceTestsFail`; fired: _none_
-- **Source repo verdict:** NotImpacted (P2, rule 3)
+- **Source repo verdict:** NeedsReview (P2, rule 7)
 - **Signals produced:** `risk:BEHAVIORAL`, `downstream:CoreShipping/xperience:medium`, `downstream:Selling/apisellingio:medium`, `downstream:Ship-AST/PickUpSvc:medium`, `downstream:Ship-AST/PudoTools:medium`, `downstream:Ship-AST/shipprefxsvc:medium`, `downstream:Selling/userpreferences:low`, `sourceTests:PASS`
-- **Live signal:** Ship-AST/PickupEligibilityService: LIVE; integration-test repos discovered: ship-ast/pickupevalbatch, ship-ast/pickupsvc, ship-ast/pudomonitor, ship-ast/pudotools
+- **Live signal:** integration-test repos discovered: ship-ast/pickupevalbatch, ship-ast/pickupsvc, ship-ast/pudomonitor, ship-ast/pudotools
 
 ### INC-008 — PickUpSvc SWU raptor-io-parent 3.1.2→3.1.3 — ECD failed, service would not start
 
@@ -96,13 +96,13 @@ Each incident is replayed by running the pipeline at the **culprit commit** (rea
 - **Victims found in blast radius:**
   - `CoreShipping/locnapi` confidence=high priority=P1
 - **Would it have been caught?** yes — needed any of `environmentGap:Sandbox`; fired: `environmentGap:Sandbox`
-- **Source repo verdict:** NotImpacted (P1, rule 3)
+- **Source repo verdict:** NeedsReview (P1, rule 7)
 - **Signals produced:** `risk:BREAKING`, `breaking:method:com.ebay.raptor.locnapi.LbspGingerClientHolder.LbspServiceClientConfiguration#getScopes()`, `breaking:method:com.ebay.raptor.locnapi.LbspGingerClientHolder.LbspServiceClientConfiguration#getProperties()`, `breaking:method:com.ebay.raptor.locnapi.init.COSURLParser#getCommand(HttpServletRequest)`, `breaking:method:com.ebay.raptor.locnapi.init.COSURLStrategy#COSURLStrategy()`, `breaking:method:com.ebay.raptor.locnapi.init.COSURLStrategy#getURLBuilder()`, `breaking:method:com.ebay.raptor.locnapi.init.COSURLStrategy#getURLParser()`, `breaking:method:com.ebay.raptor.locnapi.init.COSURLStrategy#getURLMapper()`, `breaking:method:com.ebay.raptor.locnapi.resources.InternalLocationResource#putLocation(String,CommerceLocation)`, `breaking:environment:<environment:LnP>`, `breaking:environment:<environment:Sandbox>`, `environmentGap:LnP` (+35 more)
 - **Also flagged High (unconfirmed, not proven wrong):** `CoreShipping/polis`, `Ship-AST/PickUpSvc`
 - **Pipeline notes:**
   - CoreShipping/locnapi is not registered in Code Knowledge — graph blast radius UNKNOWN (not 'no impact').
   - Blast radius computed from the local context index instead (36 repos at their default branch). Consumers outside that set remain UNKNOWN.
-- **Live signal:** CoreShipping/locnapi: LIVE; integration-test repos discovered: ship-ast/pickupnotificationservice
+- **Live signal:** integration-test repos discovered: ship-ast/pickupnotificationservice
 
 ### INC-010 — polis fails to start after Spring Boot 3 SWU — NoClassDefFoundError in returnSvcV2Client
 
@@ -114,12 +114,12 @@ Each incident is replayed by running the pipeline at the **culprit commit** (rea
 - **Victims found in blast radius:**
   - `CoreShipping/polis` confidence=high priority=P1
 - **Would it have been caught?** NO — needed any of `sourceTestsFail`; fired: _none_
-- **Source repo verdict:** NotImpacted (P1, rule 3)
+- **Source repo verdict:** NeedsReview (P1, rule 7)
 - **Signals produced:** `risk:BREAKING`, `breaking:method:com.ebay.app.PolisAppConfiguration#PolisAppConfiguration(JobBuilderFactory,StepBuilderFactory)`, `breaking:method:com.ebay.raptor.samples.components.Writer#write(List<?extendsString>)`, `buildChange:dependency:com.ebay.app.raptor:returncommon`, `buildChange:dependency:com.ebay.app.raptor:returnsvcClient`, `buildChange:dependency:com.ebay.app.raptor:returnv2common`, `buildChange:dependency:com.ebay.app.raptor:sppmtrsvcSharedLib`, `buildChange:dependency:com.ebay.baas:BatchExecutorShaded3rdLib`, `buildChange:dependency:com.ebay.cloudsec.tokenz:instrumentation-sdk`, `buildChange:dependency:com.ebay.cos.common:OrderTypes`, `buildChange:dependency:com.ebay.cosmos:CosmosTypes`, `buildChange:dependency:com.ebay.domain.raptor.posttxn:DispositionCommon` (+83 more)
 - **Pipeline notes:**
   - CoreShipping/polis is not registered in Code Knowledge — graph blast radius UNKNOWN (not 'no impact').
   - Blast radius computed from the local context index instead (36 repos at their default branch). Consumers outside that set remain UNKNOWN.
-- **Live signal:** CoreShipping/polis: LIVE
+- **Live signal:** NONE — no live-signal tests found
 
 ## Fixes, ranked by missed victims recovered
 
