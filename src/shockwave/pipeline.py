@@ -27,7 +27,8 @@ def _w(d: Path, name: str, obj):
 
 def run(org: str, repo: str, commit: str, branch: str = "staging", pr: str | None = None, backend: str | None = None,
         run_dir: str | None = None, skip_tests: bool = False, create_jira: bool = False, local_scan: bool = True,
-        only_repos: list[str] | None = None, project_override: str | None = None, cfg: Config = CONFIG) -> dict:
+        only_repos: list[str] | None = None, project_override: str | None = None, cfg: Config = CONFIG,
+        on_step=None) -> dict:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     d = Path(run_dir or Path.cwd() / "runs" / f"{org}-{repo}-{commit[:8]}-{stamp}")
     d.mkdir(parents=True, exist_ok=True)
@@ -37,8 +38,12 @@ def run(org: str, repo: str, commit: str, branch: str = "staging", pr: str | Non
 
     def step(name, fn):
         t = time.time()
+        if on_step:
+            on_step(name, "running")
         r = fn()
         timings[name] = round(time.time() - t, 1)
+        if on_step:
+            on_step(name, "done")
         return r
 
     ev = step("1-trigger", lambda: s1_trigger.ingest({"org": org, "repo": repo, "branch": branch, "commit": commit,
@@ -56,27 +61,48 @@ def run(org: str, repo: str, commit: str, branch: str = "staging", pr: str | Non
         _w(d, "02-changed-symbols.json", cs)
     _w(d, "03-tool-calls.json", kc.calls)
 
+    unknown = br.get("coverage", "none" if br["notIndexed"] else "graph") == "none"
+    empty = cs.get("emptyCommit")
     stop_reason = None
-    if br["notIndexed"]:
-        stop_reason = "source repo not indexed in Code Knowledge — blast radius UNKNOWN"
+    if empty:
+        stop_reason = f"empty commit — tree identical to parent {empty[:8]}; nothing was altered"
+    elif unknown:
+        stop_reason = "source repo not indexed in Code Knowledge and no local context — blast radius UNKNOWN"
     elif not br["impactedRepos"]:
-        stop_reason = "no downstream consumers found (indexed source; confirmed empty blast radius)"
+        stop_reason = (f"no downstream consumers found (coverage: {br.get('coverage')}; "
+                       + ("confirmed empty blast radius)" if not br["notIndexed"] else "repos outside the local context index are UNKNOWN)"))
 
-    if stop_reason and not br["notIndexed"]:
-        man, trs, verdicts = {"entries": []}, [], []
+    def tests(entries):
+        trs = s5_runner.run_many(entries, br.get("sourceApps", []), cfg,
+                                 skip="test execution disabled for this run (--skip-tests)" if skip_tests else None,
+                                 source_repo=br.get("sourceRepo"),
+                                 not_run=f"empty commit (tree identical to parent {empty[:8]}) — nothing to test" if empty else None)
+        src = next((e for e in entries if e.get("isSourceRepo")), None)
+        for t in trs:
+            if src and f"{t['org']}/{t['repo']}".lower() == f"{src['org']}/{src['repo']}".lower():
+                bl = s5_runner.baseline_at_parent(t, src, cs.get("parent"), br.get("sourceApps", []), cfg)
+                if bl:
+                    t["baseline"] = bl
+        return trs
+
+    blast_for_verdict = {**br, "changesSummary": cs.get("changesSummary"), "emptyCommit": empty}
+    if stop_reason and not unknown:
+        # the changed repo is still evaluated: self-impact is the most common incident shape
+        man = step("4-resolve", lambda: s4_resolve.resolve(br, rs, cfg))
+        man["entries"] = [e for e in man["entries"] if e.get("isSourceRepo")]
+        trs = step("5-tests", lambda: tests(man["entries"]))
+        verdicts = step("6-verdict", lambda: s6_verdict.aggregate(blast_for_verdict, trs, man))
     else:
-        man = step("4-resolve", lambda: s4_resolve.resolve(br, rs, cfg)) if not br["notIndexed"] else {"entries": []}
+        man = step("4-resolve", lambda: s4_resolve.resolve(br, rs, cfg)) if not unknown else {"entries": []}
         if only_repos:
             keep = {r.lower() for r in only_repos}
             man["entries"] = [e for e in man["entries"] if f"{e['org']}/{e['repo']}".lower() in keep]
-        trs = step("5-tests", lambda: s5_runner.run_many(man["entries"], br.get("sourceApps", []), cfg,
-                                                         skip="test execution disabled for this run (--skip-tests)" if skip_tests else None,
-                                                         source_repo=br.get("sourceRepo")))
+        trs = step("5-tests", lambda: tests(man["entries"]))
         # §2: pass changesSummary on the blast dict so aggregate() can use the risk class
         # for the priority matrix. This avoids renaming blast fields.
-        br_with_summary = {**br, "changesSummary": cs.get("changesSummary")}
+        br_with_summary = blast_for_verdict
         verdicts = step("6-verdict", lambda: s6_verdict.aggregate(br_with_summary, trs, man))
-        if only_repos and not br["notIndexed"]:
+        if only_repos and not unknown:
             keep = {r.lower() for r in only_repos}
             verdicts = [v for v in verdicts if f"{v['org']}/{v['repo']}".lower() in keep]
     _w(d, "04-manifest.json", man)

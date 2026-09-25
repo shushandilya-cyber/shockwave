@@ -10,6 +10,8 @@
   shockwave run       --org O --repo R --commit SHA [--branch B] [--skip-tests] [--create-jira]
   shockwave report    --run-dir runs/<id>
   shockwave backtest  --incidents incidents.yaml [--run-dir-root runs/backtest] [--write-docs]
+  shockwave context   build|show [--repo org/repo] [--fetch] [--force]
+  shockwave serve     [--host 127.0.0.1] [--port 8765]
 """
 from __future__ import annotations
 
@@ -66,7 +68,19 @@ def main(argv: list[str] | None = None) -> int:
     # toolchain per repo. The live signal is still computed statically (see s5_runner).
     p.add_argument("--skip-tests", action="store_true", default=True)
     p.add_argument("--run-tests", dest="skip_tests", action="store_false")
+    p.add_argument("--source-tests-only", action="store_true", help="with --run-tests: only the culprit repo's suite")
+    p.add_argument("--only", action="append", help="incident id (repeatable)")
+    p.add_argument("--doc", help="markdown output path (default docs/backtest/pudo-incidents.md)")
     p.add_argument("--out")
+    p = sub.add_parser("context")
+    p.add_argument("action", choices=["build", "show"])
+    p.add_argument("--repo", action="append", help="org/repo (repeatable); cloned into the cache if not local")
+    p.add_argument("--fetch", action="store_true", help="git fetch each default branch first")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--out")
+    p = sub.add_parser("serve")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8765)
 
     a = ap.parse_args(argv)
     from .contracts import ContractError
@@ -117,8 +131,29 @@ def main(argv: list[str] | None = None) -> int:
                 run_dir_root=Path(a.run_dir_root),
                 skip_tests=a.skip_tests,
                 write_docs=a.write_docs,
+                only=a.only,
+                source_tests_only=a.source_tests_only,
+                docs_path=Path(a.doc) if a.doc else None,
             )
             _emit(summary, a.out)
+        elif a.cmd == "context":
+            from .context import ContextIndex
+            ci = ContextIndex()
+            if a.action == "build":
+                only = None
+                if a.repo:
+                    only = []
+                    for r in a.repo:
+                        o, n = r.split("/", 1)
+                        ci.ensure_local(o, n)
+                        only.append(r.lower())
+                ci.build_all(fetch=a.fetch, force=a.force, only=only)
+            else:
+                ci.load_cached()
+            _emit({"repos": ci.summary(), "errors": ci.errors}, a.out)
+        elif a.cmd == "serve":
+            from .portal import serve
+            serve(a.host, a.port)
     except ContractError as e:
         print(f"CONTRACT ERROR: {e}", file=sys.stderr)
         return 2

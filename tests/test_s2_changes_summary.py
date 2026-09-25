@@ -197,6 +197,15 @@ class TestClassifyChanges:
         cs = classify_changes(c, None)
         assert "No commit message" in cs["intent"]
 
+    def test_intent_of_github_merge_uses_pr_title(self):
+        msg = "Merge pull request #58 from RaptorMigration/master-18756\n\nAuto Merge SWU PR"
+        cs = classify_changes(changed(), msg)
+        assert cs["intent"].startswith("Auto Merge SWU PR.")
+
+    def test_bare_merge_is_not_reported_as_missing_message(self):
+        cs = classify_changes(changed(symbols=[sym()]), "Merge branch 'master' into feature")
+        assert "No commit message" not in cs["intent"] and "no descriptive line" in cs["intent"]
+
     def test_exposed_via_populated(self):
         eps = [{"method": "GET", "path": "/waypoint", "operationId": "listWaypoints"}]
         c = changed(endpoints=eps)
@@ -447,3 +456,59 @@ class TestJiraKeysAndExposedVia:
         # the endpoint Story 2 already knew about is enriched, not duplicated
         assert len(cs["exposedVia"]) == 1
         assert cs["exposedVia"][0]["operationId"] == "listWaypoints"
+
+
+# ── contract shape rules: interfaces, enums, visibility, endpoints, builds ───────
+
+class TestContractShapeRules:
+    def test_new_abstract_interface_method_is_breaking(self):
+        s = {**sym(change="added", cls="INotifier", member="flush"), "classKind": "interface", "abstract": True}
+        group, risk, reason = _classify_symbol(s, set())
+        assert (group, risk) == ("contractChanges", "BREAKING")
+        assert "implementation" in reason
+
+    def test_new_default_interface_method_is_not_breaking(self):
+        s = {**sym(change="added", cls="INotifier", member="flush"), "classKind": "interface", "abstract": False}
+        assert _classify_symbol(s, set())[1] != "BREAKING"
+
+    def test_new_enum_constant_is_a_behavioral_contract_change(self):
+        s = {**sym(kind="field", change="added", cls="LocationProvider", member="ORANGECONNEX"), "classKind": "enum"}
+        assert _classify_symbol(s, set())[:2] == ("contractChanges", "BEHAVIORAL")
+
+    def test_removed_enum_constant_is_breaking(self):
+        s = {**sym(kind="field", change="removed", cls="LocationProvider", member="OLD"), "classKind": "enum"}
+        assert _classify_symbol(s, set())[1] == "BREAKING"
+
+    def test_removed_private_method_is_safe(self):
+        s = {**sym(change="removed", member="helper"), "visibility": "private"}
+        assert _classify_symbol(s, set())[:2] == ("internalOnly", "SAFE")
+
+    def test_removed_public_method_is_still_breaking(self):
+        s = {**sym(change="removed", member="helper"), "visibility": "public"}
+        assert _classify_symbol(s, set())[1] == "BREAKING"
+
+    def test_private_dto_field_removal_is_not_downgraded(self):
+        s = {**sym(kind="field", change="removed", cls="OrderResponse", member="total"), "visibility": "private"}
+        assert _classify_symbol(s, set())[1] == "BREAKING"
+
+    def test_removed_endpoint_is_breaking_and_listed(self):
+        cs = classify_changes(changed(endpoints=[{"method": "DELETE", "path": "/orders/{id}", "changeType": "removed"}]))
+        assert cs["overallRiskClass"] == "BREAKING"
+        assert cs["breakingChanges"][0]["path"] == "/orders/{id}"
+
+    def test_breaking_changes_carry_file_and_line(self):
+        s = {**sym(change="removed"), "visibility": "public", "line": 42}
+        cs = classify_changes(changed(symbols=[s]))
+        b = cs["breakingChanges"][0]
+        assert (b["file"], b["line"], b["className"]) == (s["file"], 42, "com.acme.MyService")
+
+    def test_pom_version_bump_is_behavioral_for_the_service_itself(self):
+        c = changed(files=["pom.xml"])
+        c["buildChanges"] = [{"file": "pom.xml", "kind": "parent", "name": "g:raptor-io-parent",
+                              "from": "4.0.3-RELEASE", "to": "4.0.4-RELEASE"}]
+        cs = classify_changes(c)
+        assert cs["overallRiskClass"] == "BEHAVIORAL"
+        assert "4.0.3-RELEASE→4.0.4-RELEASE" in cs["groups"]["internalOnly"]["reason"]
+
+    def test_pom_without_version_change_stays_safe(self):
+        assert classify_changes(changed(files=["pom.xml"]))["overallRiskClass"] == "SAFE"

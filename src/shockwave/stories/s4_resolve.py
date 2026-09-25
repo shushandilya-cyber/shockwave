@@ -107,7 +107,7 @@ def _source_entry(blast: dict) -> dict | None:
         return None
     org, repo = src.split("/", 1)
     return {
-        "org": org, "repo": repo, "confidence": "high", "isSourceRepo": True,
+        "org": org, "repo": repo, "confidence": "high", "isSourceRepo": True, "commit": blast.get("commit"),
         "evidence": [{"source": "changeEvent", "detail": "the change was made in this repo",
                       "matchedChangedCode": True}],
     }
@@ -129,7 +129,9 @@ def resolve(blast: dict, rs: RepoSource | None = None, cfg: Config = CONFIG) -> 
         ev_paths = [f for e in r.get("evidence", []) for f in (e.get("files") or [])]
         e = {"org": org, "repo": repo, "confidence": r["confidence"], "team": None, "teamSource": "unassigned",
              "owners": [], "buildTool": "unknown", "testCommand": None, "runnable": False, "defaultBranch": None,
-             "notRunnableReason": None, "repoAccess": avail, "isSourceRepo": bool(r.get("isSourceRepo"))}
+             "notRunnableReason": None, "repoAccess": avail, "isSourceRepo": bool(r.get("isSourceRepo")),
+             # the changed repo is tested AT the change; consumers are tested at their default branch
+             "commit": r.get("commit") if r.get("isSourceRepo") else None}
         if avail == "none":
             e["notRunnableReason"] = "repo not cloned locally and GitHub API unavailable — cannot inspect CODEOWNERS/build"
             entries.append(e)

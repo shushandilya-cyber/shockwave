@@ -2,7 +2,7 @@
 
 Algorithm (derived from probing the live graph — see clients/knowledge.py docstring):
 
-  1. findRepo              -> is the source indexed? (else notIndexed=true, stop)
+  1. findRepo              -> is the source indexed? (else notIndexed=true; only step 7 runs)
   2. resolve symbols       -> exact graph lookup by (name, git_repo) + FQN-suffix match;
                               vectorSearch fallback (score-gated). Unresolved are reported.
   3. direct callers  HIGH  -> vertices in OTHER repos that CALL the same FQN
@@ -13,8 +13,9 @@ Algorithm (derived from probing the live graph — see clients/knowledge.py docs
                                   (method-precise API consumer detection)
   5. repo deps       MED   -> getRepoDependencies(upstream)       (coarse safety net)
   6. openapi (other) LOW   -> inbound API consumers not linked to changed code
-  7. localScan       MED   -> `git grep` import of changed classes in local clones
-                              (catches consumers not indexed in Code Knowledge)
+  7. local context   H/M/L -> local context index over ~/Documents/projects (s3_local.py):
+                              call sites, imports, Maven deps, HTTP clients. For a source that
+                              is not indexed this is the whole blast radius.
 
 Merge rule: one entry per repo; evidence accumulates; confidence only goes up.
 """
@@ -22,13 +23,14 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 from ..clients.knowledge import KnowledgeClient, KnowledgeError
-from ..clients.repos import RepoSource, git, parse_remote
+from ..clients.repos import RepoSource
 from ..config import CONFIG, Config
+from ..context import ContextIndex
 from ..contracts import validate_blast_radius
+from .s3_local import compute_local
 
 _RANK = {"low": 0, "medium": 1, "high": 2}
 _OVERLOAD = re.compile(r"\(\+\d+\)$")
@@ -113,49 +115,82 @@ def _resolve_symbol(kc: KnowledgeClient, sym: dict, repo: str, tag: str, cfg: Co
     return res
 
 
-def _local_scan(rs: RepoSource, source: tuple[str, str], symbols: list[dict]) -> dict[str, list[str]]:
-    """{ 'org/repo': [evidence...] } for local clones importing a changed class."""
-    classes = {}
-    for s in symbols:
-        if s.get("package") and s.get("className") and s["changeType"] != "added":
-            top = s["className"].split(".")[0]
-            classes[f"{s['package']}.{top}"] = s["package"]
-    if not classes:
-        return {}
-    pats = []
-    for fq, pkg in classes.items():
-        pats += ["-e", f"import {fq};", "-e", f"import static {fq}.", "-e", f"import {pkg}.*;"]
-    hits: dict[str, list[str]] = {}
-    for key, path in rs.local_index().items():
-        if key == f"{source[0]}/{source[1]}".lower():
-            continue
-        r = subprocess.run(["git", "-C", str(path), "grep", "-I", "-l", "-F", *pats, "--", "*.java", "*.kt"],
-                           capture_output=True, text=True, timeout=60)
-        files = [f for f in r.stdout.splitlines() if f]
-        if files:
-            hits[key] = files[:10]
-    return hits
+def _context(cfg: Config, rs: RepoSource, ci: ContextIndex | None) -> ContextIndex:
+    if ci is None:
+        ci = ContextIndex(cfg, rs)
+    if not ci.repos:
+        ci.build_all()
+    return ci
+
+
+def _finish(out: dict, acc: _Acc, changed: dict, exposed: dict) -> dict:
+    existing = [s for s in changed["changedSymbols"] if s["changeType"] != "added"]
+    impacted = acc.out()
+    # Non-code / additive-only change: nothing existing changed, so coarse repo-level signals
+    # (repo deps, unlinked OpenAPI consumers) are NOT evidence of impact. Report for awareness only.
+    if not existing and not changed.get("changedApiEndpoints"):
+        out["contextRepos"] = [f"{r['org']}/{r['repo']}" for r in impacted]
+        impacted = [r for r in impacted if r["confidence"] == "high"]
+        out["notes"].append(
+            f"No existing code symbols or endpoints changed (non-code or additive-only change). "
+            f"{len(out['contextRepos'])} repo-level consumers listed in contextRepos for awareness only — not treated as impacted.")
+    out["impactedRepos"] = impacted
+    for e in (out.get("localContext") or {}).get("exposedVia", []):
+        exposed.setdefault((e["method"].upper(), e["path"]), {k: e[k] for k in ("method", "path", "operationId", "targetMethod", "reachedVia", "source")})
+    out["exposedVia"] = sorted(exposed.values(), key=lambda e: (e["path"], e["method"]))
+    out["ignoredRepos"] = sorted(acc.ignored)
+    out["coverage"] = coverage(out)
+    return validate_blast_radius(out)
+
+
+def coverage(br: dict) -> str:
+    """Which halves of Story 3 actually ran: graph+local | graph | local | none.
+    ``none`` is the only state in which the blast radius is UNKNOWN."""
+    graph = not br.get("notIndexed")
+    local = bool(br.get("localContext"))
+    return "graph+local" if graph and local else "graph" if graph else "local" if local else "none"
 
 
 def compute(changed: dict, kc: KnowledgeClient | None = None, rs: RepoSource | None = None,
-            cfg: Config = CONFIG, local_scan: bool = True) -> dict:
+            cfg: Config = CONFIG, local_scan: bool = True, ci: ContextIndex | None = None) -> dict:
     kc = kc or KnowledgeClient(cfg)
     rs = rs or RepoSource(cfg)
     org, repo, commit = changed["org"], changed["repo"], changed["commit"]
     out = {"sourceRepo": f"{org}/{repo}", "commit": commit, "impactedRepos": [], "unresolvedSymbols": [],
            "notIndexed": False, "indexedRef": None, "resolvedSymbols": [], "newSymbols": [],
            "unmappedApiCallers": [], "sourceApps": [], "notes": [], "backend": kc.backend_name}
+    acc = _Acc(org, repo)
 
-    ref = kc.indexed_ref(org, repo)
+    try:
+        ref = kc.indexed_ref(org, repo)
+    except KnowledgeError as e:
+        ref = None
+        out["notes"].append(f"Code Knowledge lookup failed: {e}")
     if not ref:
         out["notIndexed"] = True
-        out["notes"].append(f"{org}/{repo} is not registered in Code Knowledge — blast radius UNKNOWN (not 'no impact').")
+        out["notes"].append(f"{org}/{repo} is not registered in Code Knowledge — graph blast radius UNKNOWN (not 'no impact').")
         # hints only (not claims): repo-level edges sometimes exist for unindexed repos
-        deps = kc.repo_dependencies(org, repo, "upstream") or {}
+        try:
+            deps = kc.repo_dependencies(org, repo, "upstream") or {}
+        except KnowledgeError:
+            deps = {}
         out["notIndexedHints"] = sorted({f"{p[0]}/{p[1]}" for e in deps.get("edges", []) if (p := _repo_from_url(e.get("srcRepo")))})
-        return validate_blast_radius(out)
+        out["sourceApps"] = [repo.lower()]
+        if not local_scan:
+            out["coverage"] = "none"
+            return validate_blast_radius(out)
+        ci = _context(cfg, rs, ci)
+        compute_local(changed, acc, out, ci, cfg)
+        lc = out.get("localContext")
+        if lc:
+            out["sourceApps"] = sorted(set(lc["appNames"]) | {repo.lower()})
+            out["notes"].append(
+                f"Blast radius computed from the local context index instead ({lc['reposScanned']} repos at their default "
+                f"branch). Consumers outside that set remain UNKNOWN.")
+        out["newSymbols"] = [s["name"] for s in changed["changedSymbols"] if s["changeType"] == "added"]
+        out["toolCalls"] = len(kc.calls)
+        return _finish(out, acc, changed, {})
     out["indexedRef"] = ref
-    acc = _Acc(org, repo)
 
     # ---- 2. resolve changed symbols ------------------------------------
     existing = [s for s in changed["changedSymbols"] if s["changeType"] != "added"]
@@ -256,30 +291,13 @@ def compute(changed: dict, kc: KnowledgeClient | None = None, rs: RepoSource | N
             acc.add(p[0], p[1], "medium", "getRepoDependencies", f"app dependency {via}")
     out["sourceApps"] = sorted(apps | {repo.lower()})
 
-    # ---- 7. local clone scan --------------------------------------------
+    # ---- 7. local context index (imports, call sites, Maven deps, HTTP clients) ----
     if local_scan:
-        for key, files in _local_scan(rs, (org, repo), changed["changedSymbols"]).items():
-            o, r = key.split("/", 1)
-            p = rs.local_path(o, r)
-            try:
-                real = parse_remote(git(p, "remote", "get-url", "origin")) or (o, r)
-            except Exception:
-                real = (o, r)
-            acc.add(real[0], real[1], "medium", "localScan", f"imports changed class(es) in: {', '.join(files[:5])}", files=files)
+        compute_local(changed, acc, out, _context(cfg, rs, ci), cfg)
+        lc = out.get("localContext") or {}
+        out["sourceApps"] = sorted(set(out["sourceApps"]) | set(lc.get("appNames", [])))
 
-    impacted = acc.out()
-    # Non-code / additive-only change: nothing existing changed, so coarse repo-level signals
-    # (repo deps, unlinked OpenAPI consumers) are NOT evidence of impact. Report for awareness only.
-    if not existing and not changed_eps:
-        out["contextRepos"] = [f"{r['org']}/{r['repo']}" for r in impacted]
-        impacted = [r for r in impacted if r["confidence"] == "high"]
-        out["notes"].append(
-            f"No existing code symbols or endpoints changed (non-code or additive-only change). "
-            f"{len(out['contextRepos'])} repo-level consumers listed in contextRepos for awareness only — not treated as impacted.")
-    out["impactedRepos"] = impacted
-    out["exposedVia"] = sorted(exposed.values(), key=lambda e: (e["path"], e["method"]))
-    out["ignoredRepos"] = sorted(acc.ignored)
     out["toolCalls"] = len(kc.calls)
-    return validate_blast_radius(out)
+    return _finish(out, acc, changed, exposed)
 
 

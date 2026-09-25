@@ -18,6 +18,9 @@
 #   expected_risk_class: BREAKING | BEHAVIORAL | SAFE — what §1 should classify this as
 #   detection_time:  how long from deploy to incident detection (e.g. "4h", "same-day")
 #   fix_commit:      SHA of the fix or revert commit
+#   priority:        Jira priority of the incident ticket
+#   catch_signals:   glob patterns over the pipeline's detection signals (see backtest.detection_signals)
+#                    that correspond to the incident's REAL failure mechanism. "Caught" means one fired.
 #   notes:           free-text notes; unknown fields are marked "unknown"
 
 incidents:
@@ -182,3 +185,144 @@ incidents:
       but are not confirmed victims.
       changesSummary should classify the rule deletion as BREAKING (removed logic in
       exposed path).
+
+  # ── High-priority (P2) incidents for the five target repos, researched 2026-09-25 ──────────
+  # Sources: Jira (jirap) tickets and comments, PR bodies (github.corp), and git history of each
+  # repo's master. Every culprit/fix SHA below was verified with `git show` in the local clone.
+
+  - id: INC-006
+    jira: DELINS-147
+    priority: P2
+    date: "2024-12-18"
+    title: "punotif sandbox deployment failure after RaptorIO migration — no Sandbox profile"
+    culprit_repo: Ship-AST/PickupNotificationService
+    culprit_commit: "a196d8b4"
+    culprit_branch: master
+    victim_repos:
+      - Ship-AST/PickupNotificationService
+    victims_verified: true
+    verification: >
+      DELINS-147 (P2 Bug) reports the sandbox deploy of manifest punotif-0.0.1_SNAPSHOT_20241217182524509
+      failing, repeated every 4h until 2024-12-19. a196d8b4 "[SNO-5402] RaptorIO migration (#507)" was
+      committed 2024-12-17 18:05 UTC, 20 minutes before that manifest was built. It moved
+      META-INF/configuration/Sandbox to src/main/resources and added application-{Dev,QA,Staging,
+      Pre-Production,Production}.properties but no application-Sandbox.properties. The fix 8b4067e2
+      "add properties file for sandbox" adds exactly that file (93 lines) and nothing else.
+    symptom: >
+      RaptorIO (Spring Boot) starts each environment from its application-<Env> profile. With no
+      Sandbox profile the service booted without sandbox config and the Altus deploy job failed.
+    expected_risk_class: BREAKING
+    detection_time: "~4h (first automated sandbox deploy alert)"
+    fix_commit: "8b4067e2"
+    catch_signals: ["environmentGap:Sandbox"]
+    notes: >
+      Self-impact. No downstream blast radius can find this by construction; it needs a rule over the
+      repo's own environment configuration (Story 2 environmentGaps, added for this incident).
+
+  - id: INC-007
+    jira: POODLE-55
+    priority: P2
+    date: "2026-04-08"
+    title: "B2C PUDO-eligible listings down 15–20% WoW (UK/DE/FR/IT) — suspected minimal Sale readset"
+    culprit_repo: Ship-AST/PickupEligibilityService
+    culprit_commit: "fb138960"
+    culprit_branch: master
+    victim_repos:
+      - Ship-AST/PickupEligibilityService
+    victims_verified: false
+    verification: >
+      NOT CONFIRMED. POODLE-55 (P2 Bug, Fixed 2026-04-15) names fb138960 "[SHIPEE-870] Optimize subgraph
+      threadpool (#319)" as the primary suspect: EligibleForPudoDataLoader switched to
+      SaleDAO.findBySaleId(id, SaleAggregatorMap.READSET_MINIMUM, 0); if that readset omits flags12,
+      PUDO_ELIGIBLE_ITEM reads as 0. That hypothesis comes from an automated triage comment; the human
+      follow-up (Rane, 2026-04-10) only says "some code changes which were reverted" may have caused it
+      and that numbers would be re-checked. No revert of fb138960 exists on master. Scored separately.
+    symptom: >
+      WBR showed PUDO-eligible B2C listings down 15–20% week over week in UK, DE, FR and IT (week of 4/4).
+    expected_risk_class: BEHAVIORAL
+    detection_time: "~2 weeks (weekly business review)"
+    fix_commit: unknown
+    catch_signals: ["sourceTestsFail"]
+    notes: >
+      A readset that silently drops a field is invisible to static analysis: the method signature and
+      the call site are unchanged. Only a test asserting eligibility on a flags12-set Sale would catch it.
+
+  - id: INC-008
+    jira: VOODOO-9044
+    priority: P2
+    date: "2025-02-11"
+    title: "PickUpSvc SWU raptor-io-parent 3.1.2→3.1.3 — ECD failed, service would not start"
+    culprit_repo: Ship-AST/PickUpSvc
+    culprit_commit: "95c0f4b7"
+    culprit_branch: master
+    victim_repos:
+      - Ship-AST/PickUpSvc
+    victims_verified: true
+    verification: >
+      PR #441 (d4db914, merged 2025-02-12) reverts #440 with the body "The ECD pipeline failed … and it
+      won't start up on local either. This was a bad upgrade." #440 (95c0f4b7) is the auto-merged SWU for
+      VOODOO-9044 (P2): raptor-io-parent 3.1.2→3.1.3, new batch.pushgateway.version property, and a
+      commented-out line in PickupDependencies Hours.java.
+    symptom: "Release pipeline (ECD) failed; application failed to start locally."
+    expected_risk_class: BEHAVIORAL
+    detection_time: "5 days (auto-merged 2025-02-07, reverted 2025-02-12)"
+    fix_commit: "d4db914"
+    catch_signals: ["sourceTestsFail"]
+    notes: >
+      The parent bump is flagged BEHAVIORAL by the build-change rule, but every monthly SWU looks like
+      that, so it is not counted as a catch. Only a failing source-repo build/test is specific.
+
+  - id: INC-009
+    jira: CBTSHIPP-2026
+    priority: P2
+    date: "2024-11-19"
+    title: "locnapi sandbox createInventoryLocation(WAREHOUSE) → 25001 System error after RaptorIO migration"
+    culprit_repo: CoreShipping/locnapi
+    culprit_commit: "f8da817"
+    culprit_branch: master
+    victim_repos:
+      - CoreShipping/locnapi
+    victims_verified: true
+    verification: >
+      CBTSHIPP-2026 (P2 Bug): a 3P partner's createInventoryLocation with locationTypes=WAREHOUSE returned
+      errorId 25001 in Sandbox while production accepted the same request. The owner (Dafle) fixed it with
+      PR #293 (commit 0419015, 2024-11-20), which adds src/main/resources/application-Sandbox.properties and
+      nothing else in code; the reporter confirmed the fix on 2024-11-22. The file was missing since
+      f8da817 "Merge pull request #270 (eem-raptorio-migration/bvt)" (2024-11-12), which added
+      application-{Dev,QA,Integration,Pre-Production,Production,Unit}.properties but not Sandbox, while
+      META-INF/configuration/Sandbox was kept.
+    symptom: "Sandbox Sell Inventory API createInventoryLocation(WAREHOUSE) → HTTP 500 / errorId 25001."
+    expected_risk_class: BREAKING
+    detection_time: "7 days (partner report)"
+    fix_commit: "0419015"
+    catch_signals: ["environmentGap:Sandbox"]
+    notes: >
+      Same mechanism as INC-006 in a different team's repo, one month earlier. The migration also left
+      LnP without a profile; that gap is reported too but had no recorded incident.
+
+  - id: INC-010
+    jira: RAPTOR-42994
+    priority: P2
+    date: "2025-05-22"
+    title: "polis fails to start after Spring Boot 3 SWU — NoClassDefFoundError in returnSvcV2Client"
+    culprit_repo: CoreShipping/polis
+    culprit_commit: "dbcb94f"
+    culprit_branch: master
+    victim_repos:
+      - CoreShipping/polis
+    victims_verified: true
+    verification: >
+      RAPTOR-42994 (P2 Bug) quotes PR #199 (dbcb94f, DELINS-565 P2 SWU, Raptor major upgrade) and the
+      startup stack trace: BeanCreationException 'returnSvcV2Client' ← NoClassDefFoundError
+      com/ebay/marketplace/returns/v3/services/request/UpdateReturnShippingCarrierRequest. Follow-up
+      commits on master fix the dependency set: 7954341 (#200 remove DispositionCommonIO), 407edf5 (#201),
+      aa8c7be (#202 remove hibernate), cb4034e (#204 fix metadata version). The ticket was closed as
+      "Not an issue" (Jakarta variants were required for Spring Boot 3), but the app did not start.
+    symptom: "Batch application failed at startup (bean creation) — pool could not be upgraded."
+    expected_risk_class: BEHAVIORAL
+    detection_time: "1 day"
+    fix_commit: "cb4034e"
+    catch_signals: ["sourceTestsFail"]
+    notes: >
+      A missing transitive class only shows up when the Spring context is built. Whether the
+      source-repo suite boots the context decides whether this is catchable before deploy.

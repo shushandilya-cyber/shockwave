@@ -53,6 +53,13 @@ class IncidentResult:
     live_signal_note: str | None = None
     duration_s: float = 0.0
 
+    # detection: did a signal that matches the incident's real failure mechanism fire?
+    signals: list[str] = field(default_factory=list)
+    catch_signals: list[str] = field(default_factory=list)
+    caught_by: list[str] = field(default_factory=list)
+    caught: bool | None = None     # None = incident declares no catch_signals
+    source_verdict: dict | None = None
+
     # coverage gaps
     source_indexed: bool | None = None
     miss_reasons: list[dict] = field(default_factory=list)   # [{repo, category, detail}]
@@ -109,6 +116,27 @@ def _diagnose_miss(victim: str, culprit_repo: str, br: dict, context: set[str], 
                       f"or local import was found linking it to the changed code"}
 
 
+def detection_signals(cs: dict, br: dict, trs: list[dict], culprit_repo: str) -> list[str]:
+    """Every signal the pipeline produced, as ``kind:detail`` strings an incident can match with globs."""
+    summ = cs.get("changesSummary") or {}
+    out = [f"risk:{summ.get('overallRiskClass')}"]
+    out += [f"breaking:{b.get('kind')}:{b.get('symbol')}" for b in summ.get("breakingChanges") or []]
+    out += [f"environmentGap:{g['environment']}" for g in cs.get("environmentGaps") or []]
+    out += [f"buildChange:{b['kind']}:{b['name']}" for b in cs.get("buildChanges") or []]
+    out += [f"downstream:{r['org']}/{r['repo']}:{r['confidence']}" for r in br.get("impactedRepos") or []]
+    for t in trs:
+        if f"{t['org']}/{t['repo']}".lower() == (culprit_repo or "").lower():
+            out.append(f"sourceTests:{t['status']}")
+            if t["status"] in ("FAIL", "ERROR"):
+                out.append("sourceTestsFail")
+    return out
+
+
+def match_signals(signals: list[str], patterns: list[str]) -> list[str]:
+    from fnmatch import fnmatchcase
+    return [s for s in signals if any(fnmatchcase(s, p) for p in patterns)]
+
+
 def _load_incidents(path: Path) -> list[dict]:
     with open(path) as f:
         data = yaml.safe_load(f)
@@ -120,11 +148,13 @@ def backtest_incident(
     cfg: Config = CONFIG,
     run_dir_root: Path | None = None,
     skip_tests: bool = True,
+    source_tests_only: bool = False,
 ) -> IncidentResult:
     """Run the pipeline at the incident's culprit commit and score it.
 
     skip_tests defaults to True for backtest so we don't need build toolchains
     for every incident — the live signal is assessed from static scan only.
+    source_tests_only runs only the culprit repo's suite (the blast radius is still computed).
     """
     from .. import pipeline as _pipeline
 
@@ -163,6 +193,7 @@ def backtest_incident(
             create_jira=False,
             local_scan=True,
             run_dir=str(run_dir) if run_dir else None,
+            only_repos=[culprit_repo] if source_tests_only and not skip_tests else None,
             cfg=cfg,
         )
         run_dir_path = result.get("runDir")
@@ -252,7 +283,14 @@ def backtest_incident(
         live_notes.append(f"integration-test repos discovered: {', '.join(sorted(it_repos))}")
     live_signal_note = "; ".join(live_notes) if live_notes else "NONE — no live-signal tests found"
 
+    signals = detection_signals(cs_artifact, br, trs, culprit_repo)
+    catch = list(inc.get("catch_signals") or [])
+    caught_by = match_signals(signals, catch)
+
     return IncidentResult(
+        signals=signals, catch_signals=catch, caught_by=caught_by,
+        caught=(bool(caught_by) if catch else None),
+        source_verdict={k: src_verdict.get(k) for k in ("verdict", "priority", "rule", "reasoning")} if src_verdict else None,
         incident_id=inc_id, title=title, culprit_repo=culprit_repo,
         culprit_commit=culprit_commit, victim_repos=victim_repos,
         victims_verified=victims_verified, verification=verification,
@@ -273,13 +311,19 @@ def run_backtest(
     run_dir_root: Path | None = None,
     skip_tests: bool = True,
     write_docs: bool = True,
+    only: list[str] | None = None,
+    source_tests_only: bool = False,
+    docs_path: Path | None = None,
 ) -> dict[str, Any]:
     incidents = _load_incidents(incidents_path)
+    if only:
+        want = {i.upper() for i in only}
+        incidents = [i for i in incidents if str(i.get("id", "")).upper() in want]
     results: list[IncidentResult] = []
 
     for inc in incidents:
         print(f"  backtesting {inc.get('id')} — {inc.get('title', '')[:60]} ...")
-        r = backtest_incident(inc, cfg, run_dir_root, skip_tests)
+        r = backtest_incident(inc, cfg, run_dir_root, skip_tests, source_tests_only)
         results.append(r)
 
     # ── aggregate stats ───────────────────────────────────────────────────────
@@ -305,8 +349,11 @@ def run_backtest(
     avg_precision = sum(precisions) / len(precisions) if precisions else None
     risk_scored = [r for r in scorable if r.risk_class_correct is not None]
     risk_correct = sum(1 for r in risk_scored if r.risk_class_correct)
+    detect_scored = [r for r in scorable if r.caught is not None]
 
     summary = {
+        "caught_for_right_reason": f"{sum(1 for r in detect_scored if r.caught)}/{len(detect_scored)}" if detect_scored else "n/a",
+        "tests_run": not skip_tests,
         "total_incidents": total,
         "scorable_incidents": len(scorable),
         "verified_incidents": len(verified),
@@ -325,7 +372,7 @@ def run_backtest(
 
     # ── write docs ────────────────────────────────────────────────────────────
     if write_docs:
-        docs_path = Path("docs/backtest/pudo-incidents.md")
+        docs_path = docs_path or Path("docs/backtest/pudo-incidents.md")
         docs_path.parent.mkdir(parents=True, exist_ok=True)
         docs_path.write_text(_render_incidents_md(results, summary))
         print(f"  wrote {docs_path}")
@@ -384,6 +431,13 @@ def _render_incidents_md(results: list[IncidentResult], summary: dict) -> str:
         f"| Avg recall (verified incidents only) | {summary['avg_recall']:.0%} |",
         f"| Avg precision of High | {f'{prec:.0%}' if prec is not None else 'n/a'} |",
         f"| Risk class classified as expected | {summary['risk_class_correct']} |",
+        f"| Caught by a signal matching the real failure mechanism | {summary.get('caught_for_right_reason', 'n/a')} |",
+        f"| Test execution | {'source/downstream suites run in temp clones' if summary.get('tests_run') else 'skipped (static signals only)'} |",
+        "",
+        "**Reading \"caught\":** recall only asks whether the victim appeared in the output. A self-impact "
+        "victim always does, because the source repo is always evaluated. \"Caught\" is stricter: each "
+        "incident lists the `catch_signals` that correspond to its real failure mechanism (for example "
+        "`environmentGap:Sandbox` or `sourceTestsFail`), and it counts only if one of those actually fired.",
         "",
         "**Reading precision:** an incident record lists only victims we could evidence. "
         "A High-confidence repo that is not on that list is *unconfirmed*, not a proven "
@@ -409,20 +463,21 @@ def _render_incidents_md(results: list[IncidentResult], summary: dict) -> str:
     L += [
         "## Per-Incident Results",
         "",
-        "| ID | Title | Culprit | Victims found | Recall | Risk class | Live signal |",
-        "|---|---|---|---|---|---|---|",
+        "| ID | Title | Culprit | Victims found | Recall | Risk class | Caught | Live signal |",
+        "|---|---|---|---|---|---|---|---|",
     ]
 
     errored = {r.incident_id for r in results
                if any(n.startswith("pipeline raised") for n in r.pipeline_notes)}
     for r in results:
         if not r.culprit_commit or r.culprit_commit == "unknown":
-            L.append(f"| {r.incident_id} | {r.title[:40]} | _unknown_ | — | n/a | — | — |")
+            L.append(f"| {r.incident_id} | {r.title[:40]} | _unknown_ | — | n/a | — | — | — |")
             continue
         if r.incident_id in errored:
             L.append(f"| {r.incident_id} | {r.title[:40]} | `{r.culprit_commit[:8]}` "
-                     f"| _pipeline error_ | — | — | — |")
+                     f"| _pipeline error_ | — | — | — | — |")
             continue
+        det = "—" if r.caught is None else ("**yes**" if r.caught else "**NO**")
         caught = (f"{len(r.victims_found)}/{len(r.victim_repos)}"
                   if r.victims_found else ("none" if r.victim_repos else "—"))
         risk_ok = (
@@ -434,7 +489,7 @@ def _render_incidents_md(results: list[IncidentResult], summary: dict) -> str:
             "MOCKED" if "MOCKED" in (r.live_signal_note or "") else "NONE")
         L.append(
             f"| {r.incident_id} | {r.title[:40]} | `{r.culprit_commit[:8]}` "
-            f"| {caught} | {r.recall:.0%} | {risk_ok} | {live} |"
+            f"| {caught} | {r.recall:.0%} | {risk_ok} | {det} | {live} |"
         )
 
     L += ["", "## Per-Incident Detail", ""]
@@ -455,6 +510,16 @@ def _render_incidents_md(results: list[IncidentResult], summary: dict) -> str:
             L.append("- **Victims found in blast radius:**")
             for v in r.victims_found:
                 L.append(f"  - `{v['repo']}` confidence={v['confidence']} priority={v['priority']}")
+        if r.catch_signals:
+            L.append(f"- **Would it have been caught?** {'yes' if r.caught else 'NO'} — needed any of "
+                     f"{', '.join(f'`{c}`' for c in r.catch_signals)}; fired: "
+                     f"{', '.join(f'`{c}`' for c in r.caught_by) or '_none_'}")
+        if r.source_verdict:
+            L.append(f"- **Source repo verdict:** {r.source_verdict.get('verdict')} "
+                     f"({r.source_verdict.get('priority')}, rule {r.source_verdict.get('rule')})")
+        if r.signals:
+            L.append(f"- **Signals produced:** {', '.join(f'`{s}`' for s in r.signals[:12])}"
+                     + (f" (+{len(r.signals) - 12} more)" if len(r.signals) > 12 else ""))
         if r.unconfirmed_high:
             L.append(f"- **Also flagged High (unconfirmed, not proven wrong):** "
                      f"{', '.join(f'`{x}`' for x in r.unconfirmed_high[:8])}")

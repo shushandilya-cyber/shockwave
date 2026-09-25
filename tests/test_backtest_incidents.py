@@ -20,6 +20,8 @@ from shockwave.stories.backtest import (
     MISS_VICTIM_NOT_INDEXED,
     IncidentResult,
     backtest_incident,
+    detection_signals,
+    match_signals,
     rank_fixes,
 )
 
@@ -54,6 +56,38 @@ class TestIncidentFile:
             repos = [inc["culprit_repo"], *inc["victim_repos"]]
             for r in repos:
                 assert "/" in r, f"{inc['id']}: {r!r} is not org/repo"
+
+
+    def test_every_catch_signal_is_a_known_kind(self):
+        kinds = {"risk", "breaking", "environmentGap", "buildChange", "downstream", "sourceTests", "sourceTestsFail"}
+        for inc in yaml.safe_load(INCIDENTS.read_text())["incidents"]:
+            for p in inc.get("catch_signals") or []:
+                assert p.split(":", 1)[0] in kinds, f"{inc['id']}: unknown signal kind in {p!r}"
+
+
+# ── detection signals ─────────────────────────────────────────────────────────────
+
+class TestDetectionSignals:
+    CS = {"changesSummary": {"overallRiskClass": "BREAKING",
+                             "breakingChanges": [{"kind": "environment", "symbol": "<environment:Sandbox>"}]},
+          "environmentGaps": [{"environment": "Sandbox"}],
+          "buildChanges": [{"kind": "parent", "name": "g:raptor-io-parent"}]}
+    BR = {"impactedRepos": [{"org": "U", "repo": "c", "confidence": "high"}]}
+
+    def test_signals_cover_every_story(self):
+        s = detection_signals(self.CS, self.BR, [{"org": "O", "repo": "src", "status": "FAIL"}], "O/src")
+        assert {"risk:BREAKING", "environmentGap:Sandbox", "buildChange:parent:g:raptor-io-parent",
+                "downstream:U/c:high", "sourceTests:FAIL", "sourceTestsFail"} <= set(s)
+
+    def test_downstream_test_failure_is_not_a_source_failure(self):
+        s = detection_signals(self.CS, self.BR, [{"org": "U", "repo": "c", "status": "FAIL"}], "O/src")
+        assert "sourceTestsFail" not in s
+
+    def test_globs_match_only_the_named_mechanism(self):
+        s = detection_signals(self.CS, self.BR, [], "O/src")
+        assert match_signals(s, ["environmentGap:Sandbox"]) == ["environmentGap:Sandbox"]
+        assert match_signals(s, ["downstream:U/*:high"]) == ["downstream:U/c:high"]
+        assert match_signals(s, ["sourceTestsFail"]) == []
 
 
 # ── fix ranking is derived, not authored ──────────────────────────────────────────
@@ -121,3 +155,27 @@ class TestIncidentsLive:
         r = backtest_incident(_incident("INC-005"))
         assert r.recall == 1.0, f"self-impact victim missed: {r.miss_reasons}"
         assert r.actual_risk_class == "BREAKING"
+
+    def test_inc006_punotif_missing_sandbox_profile_is_caught_statically(self):
+        r = backtest_incident(_incident("INC-006"))
+        assert r.caught is True, r.signals
+        assert r.actual_risk_class == "BREAKING"
+
+    def test_inc007_readset_change_is_not_claimed_as_caught_without_tests(self):
+        # static analysis cannot see a readset that drops a field; skip_tests must not report a catch
+        r = backtest_incident(_incident("INC-007"))
+        assert r.caught is False and r.victims_verified is False
+
+    def test_inc008_pickupsvc_swu_is_flagged_as_runtime_upgrade(self):
+        r = backtest_incident(_incident("INC-008"))
+        assert any(s.startswith("buildChange:parent:") and "raptor-io-parent" in s for s in r.signals)
+        assert r.actual_risk_class in ("BEHAVIORAL", "BREAKING")
+
+    def test_inc009_locnapi_missing_sandbox_profile_is_caught_statically(self):
+        r = backtest_incident(_incident("INC-009"))
+        assert r.caught is True, r.signals
+        assert "environmentGap:LnP" in r.signals
+
+    def test_inc010_polis_swu_source_repo_is_evaluated(self):
+        r = backtest_incident(_incident("INC-010"))
+        assert r.recall == 1.0 and r.source_verdict is not None

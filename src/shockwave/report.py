@@ -138,7 +138,18 @@ def render_run(d: Path) -> str:
     if changes_summary:
         L += _render_changes_summary(changes_summary)
 
-    if br.get("notIndexed"):
+    L += _impact_summary(br, cs, vs)
+    L += _breaking_changes(br, changes_summary or {})
+    L += _per_repo_impact(br, vs)
+
+    lc = br.get("localContext") or {}
+    if br.get("notIndexed") and lc:
+        L += [f"> **Code Knowledge has no index for {src}.** The blast radius below comes from the local context index "
+              f"({lc.get('reposScanned')} repos at their default branch, source at `{lc.get('sourceRef')}`). "
+              "Consumers outside that set are UNKNOWN, not unaffected.", ""]
+        if br.get("notIndexedHints"):
+            L += [f"> Unverified repo-level hints: {', '.join(br['notIndexedHints'])}", ""]
+    elif br.get("notIndexed"):
         L += ["> **BLAST RADIUS UNKNOWN** — source repo is not registered in Code Knowledge. This is NOT 'no impact'.", ""]
         if br.get("notIndexedHints"):
             L += [f"> Unverified repo-level hints: {', '.join(br['notIndexedHints'])}", ""]
@@ -155,8 +166,9 @@ def render_run(d: Path) -> str:
     for n in cs.get("notes", []):
         L.append(f"- _note: {n}_")
 
-    L += ["", "## Blast Radius", f"Indexed as `{br.get('indexedRef')}` · resolved symbols: {len(br.get('resolvedSymbols', []))} · "
-          f"transitive internal callers: {br.get('transitiveCallerCount', 0)} · tool calls: {br.get('toolCalls')}", "",
+    L += ["", "## Blast Radius", f"Coverage: **{br.get('coverage', '—')}** · indexed as `{br.get('indexedRef')}` · "
+          f"resolved symbols: {len(br.get('resolvedSymbols', []))} · transitive internal callers: {br.get('transitiveCallerCount', 0)} · "
+          f"local type closure: {lc.get('typeClosureSize', '—')} · tool calls: {br.get('toolCalls')}", "",
           "| # | Repo | Confidence | Priority | Sources | Key evidence |",
           "|---|---|---|---|---|---|"]
     # §2: find risk class from changesSummary for each verdict's priority display
@@ -199,7 +211,19 @@ def render_run(d: Path) -> str:
             # flag NOT_RUN prominently
             status_display = f"**{status}**" if status in ("NOT_RUN", "FAIL") else status
             det = t.get("skippedReason") or t.get("notRunReason") or (", ".join(t.get("failedTests", [])[:3]) or f"{t.get('testsRun')} tests")
-            L.append(f"| {t['org']}/{t['repo']} | {status_display} | {ls} | {t['durationSeconds']}s | {str(det)[:120]} |")
+            at = f" @ `{t['commit'][:8]}`" if t.get("commit") else ""
+            L.append(f"| {t['org']}/{t['repo']}{at} | {status_display} | {ls} | {t['durationSeconds']}s | {str(det)[:120]} |")
+        for t in trs:
+            bl = t.get("baseline")
+            if not bl:
+                continue
+            L += ["", f"**Parent baseline for {t['org']}/{t['repo']}** — failing classes re-run at parent "
+                      f"`{str(bl.get('commit'))[:8]}` (`{bl.get('command') or '-'}`): {bl.get('status')}"]
+            if bl.get("reason"):
+                L.append(f"- inconclusive: {bl['reason']}")
+            else:
+                L.append(f"- pre-existing (also fail at parent): {', '.join(bl.get('preExisting') or []) or 'none'}")
+                L.append(f"- new at this commit: {', '.join(bl.get('newFailures') or []) or 'none'}")
         # Show integration-test repos discovered (§3)
         it_repos = []
         for t in trs:
@@ -223,6 +247,107 @@ def render_run(d: Path) -> str:
     L += _confidence_legend()
 
     return "\n".join(L) + "\n"
+
+
+_CONF_ORDER = {"high": 0, "medium": 1, "unknown": 2, "low": 3}
+
+
+def _priority(risk: str | None, conf: str) -> str:
+    from .contracts import priority_for
+    return priority_for(risk, conf)
+
+
+def _impact_summary(br: dict, cs: dict, vs: list[dict]) -> list[str]:
+    """Item 3: the answer in five lines — how far it reaches, how bad, what to look at first."""
+    summ = cs.get("changesSummary") or {}
+    risk = summ.get("overallRiskClass")
+    repos = br.get("impactedRepos") or []
+    by_conf: dict[str, int] = {}
+    for r in repos:
+        by_conf[r["confidence"]] = by_conf.get(r["confidence"], 0) + 1
+    pri: dict[str, list[str]] = {}
+    for r in repos:
+        pri.setdefault(_priority(risk, r["confidence"]), []).append(f"{r['org']}/{r['repo']}")
+    src_v = next((v for v in vs if v.get("isSourceRepo")), None)
+    L = ["## Impact Summary", ""]
+    if br.get("coverage") == "none" or (br.get("notIndexed") and not br.get("localContext")):
+        L += ["- **Reach: UNKNOWN** — neither Code Knowledge nor the local context index could look. Not 'no impact'.", ""]
+        return L
+    conf_txt = ", ".join(f"{n} {c}" for c, n in sorted(by_conf.items(), key=lambda x: _CONF_ORDER.get(x[0], 9)))
+    L.append(f"- **Reach:** {len(repos)} downstream repo(s) impacted" + (f" ({conf_txt})" if repos else "")
+             + f" · coverage `{br.get('coverage', '—')}`")
+    L.append(f"- **Severity:** overall risk class `{risk or '—'}` · {len(summ.get('breakingChanges') or [])} breaking change(s) · "
+             f"{len(summ.get('exposedVia') or br.get('exposedVia') or [])} exposed endpoint(s)")
+    for p in ("P1", "P2", "P3"):
+        if pri.get(p):
+            L.append(f"- **{p}:** {', '.join(pri[p][:8])}" + (f" (+{len(pri[p]) - 8} more)" if len(pri[p]) > 8 else ""))
+    if src_v:
+        L.append(f"- **Source repo itself:** {src_v['verdict']} ({src_v.get('priority')}) — tests in the changed repo are the first line of defence")
+    if not repos:
+        L.append("- No downstream consumer references any changed code in the scanned repos.")
+    L.append("")
+    return L
+
+
+def _hits_breaking(entry: dict, b: dict) -> list[dict]:
+    """Evidence items in ``entry`` that reference breaking change ``b``."""
+    out = []
+    for e in entry.get("evidence", []):
+        if b["symbol"] in (e.get("symbols") or []):
+            out.append(e)
+        elif b.get("path") and b["path"] in str(e.get("api", "")):
+            out.append(e)
+        elif b.get("className") and b.get("member") and str(e.get("targetFqn", "")).startswith(b["className"]) \
+                and f".{b['member']}" in str(e.get("targetFqn", "")):
+            out.append(e)
+        elif b.get("className") and b["kind"] == "class" and b["className"] in str(e.get("targetFqn", "")):
+            out.append(e)
+    return out
+
+
+def _breaking_changes(br: dict, summ: dict) -> list[str]:
+    """Item 2: every BREAKING change, with the consumers that reference it."""
+    items = summ.get("breakingChanges") or []
+    L = ["## Breaking Changes", ""]
+    if not items:
+        L += [f"_None. Overall risk class is `{summ.get('overallRiskClass', '—')}`: nothing was removed or had its contract changed "
+              "in a way existing callers depend on._", ""]
+        return L
+    L += ["| Change | Why it breaks | Where | Consumers that reference it |", "|---|---|---|---|"]
+    for b in items:
+        users = [f"{r['org']}/{r['repo']}" for r in br.get("impactedRepos", []) if _hits_breaking(r, b)]
+        where = f"`{b['file']}:{b.get('line') or ''}`" if b.get("file") else "API spec"
+        who = (", ".join(users) if users else f"every caller of this service in {b['environment']}"
+               if b.get("kind") == "environment" else "_none found in graph or local context_")
+        L.append(f"| `{b['symbol'][:90]}` | {b['reason'][:110].replace('|', '/')} | {where} | {who} |")
+    L.append("")
+    return L
+
+
+def _per_repo_impact(br: dict, vs: list[dict]) -> list[str]:
+    """Item 1: for each impacted repo, what exactly it uses and how we know."""
+    repos = br.get("impactedRepos") or []
+    if not repos:
+        return []
+    risk_by = {f"{v['org']}/{v['repo']}".lower(): v for v in vs}
+    L = ["## What Is Impacted, Per Repo", ""]
+    for r in sorted(repos, key=lambda r: _CONF_ORDER.get(r["confidence"], 9)):
+        v = risk_by.get(f"{r['org']}/{r['repo']}".lower()) or {}
+        L.append(f"### {r['org']}/{r['repo']} — {r['confidence']} confidence · {v.get('priority', '—')} · {v.get('verdict', '—')}")
+        syms = sorted({s for e in r["evidence"] for s in (e.get("symbols") or [])} |
+                      {e["targetFqn"] for e in r["evidence"] if e.get("targetFqn")})
+        apis = sorted({e["api"] for e in r["evidence"] if e.get("api") and e.get("matchedChangedCode")})
+        if syms:
+            L.append(f"- **Changed code it uses:** " + ", ".join(f"`{s.split('/')[-1][:80]}`" for s in syms[:6])
+                     + (f" (+{len(syms) - 6} more)" if len(syms) > 6 else ""))
+        if apis:
+            L.append(f"- **Endpoints it calls that reach the change:** " + ", ".join(f"`{a}`" for a in apis[:5]))
+        for e in sorted(r["evidence"], key=lambda e: not e.get("matchedChangedCode"))[:5]:
+            L.append(f"- `{e['source']}` — {e['detail'][:260]}")
+        if len(r["evidence"]) > 5:
+            L.append(f"- … {len(r['evidence']) - 5} more evidence item(s) in `03-blast-radius.json`")
+        L.append("")
+    return L
 
 
 def _changed_symbols_appendix(cs: dict) -> list[str]:

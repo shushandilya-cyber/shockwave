@@ -166,6 +166,37 @@ def _classify_symbol(sym: dict, resource_classes: set[str], repo: str | None = N
             f"class structure modified (e.g. annotations, inheritance): {cls_tail}",
         )
 
+    # ── interfaces: every implementation is a caller of the whole contract ─────────
+    if kind == "method" and sym.get("classKind") == "interface" and sym.get("abstract"):
+        if change == "added":
+            return ("contractChanges", "BREAKING",
+                    f"new abstract method {cls_tail}.{member} on an interface: every implementation outside "
+                    f"this repo stops compiling until it implements it")
+        if change == "removed":
+            return ("contractChanges", "BREAKING",
+                    f"interface method {cls_tail}.{member} removed: callers through the interface stop compiling")
+
+    # ── enum constants are values on the wire ──────────────────────────────────────
+    if kind == "field" and sym.get("classKind") == "enum":
+        if change == "removed":
+            return ("contractChanges", "BREAKING",
+                    f"enum constant {cls_tail}.{member} removed: code and payloads that use it break")
+        if change == "added":
+            return ("contractChanges", "BEHAVIORAL",
+                    f"new enum constant {cls_tail}.{member}: consumers that deserialize {cls_tail} strictly "
+                    f"or switch over it exhaustively may reject or mishandle the new value")
+
+    if kind == "method" and change == "modified" and sym.get("loggingOnly"):
+        return ("internalOnly", "SAFE",
+                f"logging-only change in {cls_tail}.{member}: with log/CAL calls removed the old and new bodies are identical")
+
+    # ── private methods cannot be called outside their class ─────────────────────
+    # (fields are excluded: a private DTO field is still serialized, so removing it breaks the wire format)
+    if kind == "method" and sym.get("visibility") == "private":
+        if change == "removed":
+            return "internalOnly", "SAFE", f"private method {cls_tail}.{member} removed (not callable outside {cls_tail})"
+        return "behaviorChanges", "BEHAVIORAL", f"logic change in private helper {cls_tail}.{member}"
+
     # ── method changes ─────────────────────────────────────────────────────────────
     if kind == "method":
         in_resource = cls_tail in resource_classes or bool(_RESOURCE_CLS.search(cls_tail))
@@ -318,6 +349,7 @@ def classify_changes(changed: dict, commit_msg: str | None = None) -> dict:
     }
 
     repo_name = changed.get("repo")
+    breaking: list[dict] = []
     for sym in symbols:
         group, risk, reason = _classify_symbol(sym, resource_classes, repo_name)
         g = groups[group]
@@ -325,10 +357,24 @@ def classify_changes(changed: dict, commit_msg: str | None = None) -> dict:
         g["riskClasses"].append(risk)
         if reason not in g["reasons"]:
             g["reasons"].append(reason)
+        if risk == "BREAKING":
+            breaking.append({"symbol": sym["name"], "kind": sym["kind"], "changeType": sym["changeType"],
+                             "reason": reason, "file": sym.get("file"), "line": sym.get("line"),
+                             "className": f"{sym['package']}.{sym['className'].split('.')[0]}" if sym.get("package") and sym.get("className") else None,
+                             "member": sym.get("member")})
 
     # Synthetic entries for changed non-source files, which yield no symbols to classify
+    upgrades: dict[str, list[dict]] = {}
+    for b in changed.get("buildChanges") or []:
+        upgrades.setdefault(b["file"], []).append(b)
     for cf in config_files:
         group, risk, reason = classify_config_file(cf, repo_name)
+        if upgrades.get(cf):
+            # a parent/dependency version bump ships different library code inside this service
+            bits = ", ".join(f"{b['name']} {b['from'] or '∅'}→{b['to'] or '∅'}" for b in upgrades[cf][:4])
+            group, risk, reason = ("internalOnly", "BEHAVIORAL",
+                                   f"runtime dependency change in {Path(cf).name}: {bits} — this service's own behaviour "
+                                   f"can change; its API contract does not")
         g = groups[group]
         g["symbols"].append(f"<data:{Path(cf).name}>")
         g["riskClasses"].append(risk)
@@ -337,7 +383,7 @@ def classify_changes(changed: dict, commit_msg: str | None = None) -> dict:
 
     # Endpoint changes (summary)
     for ep in eps:
-        change_ep = "added" if ep.get("changeType") == "added" else "modified"
+        change_ep = ep.get("changeType") if ep.get("changeType") in ("added", "removed") else "modified"
         g = groups["contractChanges"]
         name = f"{ep['method']} {ep['path']}"
         if name not in g["symbols"]:
@@ -346,6 +392,24 @@ def classify_changes(changed: dict, commit_msg: str | None = None) -> dict:
             reason = f"endpoint {change_ep}: {name}"
             if reason not in g["reasons"]:
                 g["reasons"].append(reason)
+            if change_ep == "removed":
+                breaking.append({"symbol": name, "kind": "endpoint", "changeType": "removed", "reason": reason,
+                                 "file": None, "line": None, "className": None, "member": ep.get("operationId"),
+                                 "method": ep["method"], "path": ep["path"]})
+
+    for gap in changed.get("environmentGaps") or []:
+        env, mod = gap["environment"], gap["module"]
+        name = f"<environment:{env}>" if mod == "." else f"<environment:{mod}:{env}>"
+        reason = (f"environment {env} lost its runtime config: {mod}/ has Spring profiles for "
+                  f"{', '.join(gap['profilesPresent'])} but no application-{env}.properties, while legacy config "
+                  f"{gap['legacyConfig']} still exists — a deploy to {env} starts without it")
+        g = groups["configDataOnly"]
+        g["symbols"].append(name)
+        g["riskClasses"].append("BREAKING")
+        g["reasons"].append(reason)
+        breaking.append({"symbol": name, "kind": "environment", "changeType": "removed", "reason": reason,
+                         "file": gap["legacyConfig"], "line": None, "className": None, "member": None,
+                         "environment": env})
 
     # Collapse each group
     result_groups: dict[str, dict] = {}
@@ -373,6 +437,7 @@ def classify_changes(changed: dict, commit_msg: str | None = None) -> dict:
         "jiraKeys": jira_keys(commit_msg),
         "groups": result_groups,
         "overallRiskClass": overall,
+        "breakingChanges": breaking,
         "exposedVia": [
             {"method": e["method"], "path": e["path"],
              "operationId": e.get("operationId")}
@@ -449,19 +514,18 @@ def _intent_from_msg(msg: str | None, changed: dict) -> str:
     keys = jira_keys(msg)
     citation = f"[{', '.join(keys) + ' · ' if keys else ''}{org}/{repo}@{commit}]"
 
-    if msg:
-        lines = [ln.strip() for ln in msg.splitlines() if ln.strip()]
-        if lines:
-            # A revert names what it undoes, which is the intent — keep it, just tidy it.
-            # Quotes are dropped rather than balanced: the subject of a revert is quoted,
-            # and stripping one end leaves a stray mark mid-sentence.
-            first = lines[0].replace('"', "")
-            first = _PR_SUFFIX.sub("", first).strip()
-            first = _TICKET_PREFIX.sub("", first).strip()
-            if first and not _MERGE_PREFIX.match(first):
-                if len(first) > 200:
-                    first = first[:197] + "…"
-                return f"{first}. {citation}"
+    # A GitHub merge subject says nothing; the PR title follows it in the body.
+    for line in [ln.strip() for ln in (msg or "").splitlines() if ln.strip()][:3]:
+        # A revert names what it undoes, which is the intent — keep it, just tidy it.
+        # Quotes are dropped rather than balanced: the subject of a revert is quoted,
+        # and stripping one end leaves a stray mark mid-sentence.
+        first = line.replace('"', "")
+        first = _PR_SUFFIX.sub("", first).strip()
+        first = _TICKET_PREFIX.sub("", first).strip()
+        if first and not _MERGE_PREFIX.match(first):
+            if len(first) > 200:
+                first = first[:197] + "…"
+            return f"{first}. {citation}"
 
     # Fallback: describe the change structurally
     n_syms = len(changed.get("changedSymbols", []))
@@ -477,4 +541,5 @@ def _intent_from_msg(msg: str | None, changed: dict) -> str:
     if config_files:
         parts.append(f"config files: {', '.join(Path(f).name for f in config_files[:3])}")
     desc = "; ".join(parts) if parts else "no symbols or endpoints detected"
-    return f"Commit {citation}: {desc}. (No commit message provided.)"
+    note = "No commit message provided." if not (msg or "").strip() else "Commit message has no descriptive line."
+    return f"Commit {citation}: {desc}. ({note})"

@@ -9,6 +9,11 @@ Decision table (first match wins) — intentionally conservative:
   6. SKIPPED or NOT_RUN (or no TestResult)           -> NeedsReview
   7. PASS  + no live signal NONE                     -> NeedsReview  (passing unrelated tests proves nothing)
 
+Source-repo only (the changed repo is tested at the change, and at its parent when red):
+  0. tree identical to parent (empty commit)         -> NotImpacted  (nothing was altered)
+  8. FAIL, every failure also fails at the parent    -> decided as PASS; failures reported as pre-existing
+  9. FAIL, a test passes at the parent and fails here -> Impacted     (this commit broke its own repo)
+
 §2 Priority: uses risk class from changesSummary (§1) × blast-radius confidence.
 Matrix (unit-tested in tests/test_s2_changes_summary.py):
   BREAKING + High = P1
@@ -111,6 +116,25 @@ def decide(blast_entry: dict | None, tr: dict | None) -> tuple[str, str, int]:
     ), 7
 
 
+def _decide_source(blast: dict, tr: dict | None) -> tuple[str, str, int]:
+    src = {"confidence": "high", "evidence": [{"source": "changeEvent", "detail": "the change was made in this repo"}]}
+    if blast.get("emptyCommit"):
+        return "NotImpacted", (f"Empty commit: its tree is identical to parent {str(blast['emptyCommit'])[:8]}, "
+                               "so it altered no file, symbol, endpoint or dependency."), 0
+    bl = (tr or {}).get("baseline")
+    if tr and tr.get("status") == "FAIL" and bl and bl.get("status") in ("PASS", "FAIL"):
+        p8 = str(bl["commit"])[:8]
+        if bl.get("newFailures"):
+            new = bl["newFailures"]
+            return "Impacted", (f"{len(new)} test(s) pass at parent {p8} and fail at this commit "
+                                f"({', '.join(new[:5])}): the change altered this repo's own behaviour."), 9
+        pre = bl.get("preExisting") or []
+        verdict, reasoning, _ = decide(src, {**tr, "status": "PASS"})
+        return verdict, (f"The {len(pre)} failing test(s) also fail at parent {p8} ({', '.join(pre[:3])}) — pre-existing, "
+                         f"not caused by this change. With those set aside: {reasoning}"), 8
+    return decide(src, tr)
+
+
 def aggregate(blast: dict, test_results: list[dict] | None, manifest: dict | None = None) -> list[dict]:
     test_results = test_results or []
     teams = {f"{e['org']}/{e['repo']}".lower(): e for e in (manifest or {}).get("entries", [])}
@@ -120,7 +144,8 @@ def aggregate(blast: dict, test_results: list[dict] | None, manifest: dict | Non
     # We accept it as an optional key ``changesSummary`` on the blast dict for pipeline use.
     risk_class = (blast.get("changesSummary") or {}).get("overallRiskClass") or None
 
-    if blast.get("notIndexed"):
+    # rule 1 applies only when neither the graph nor the local context index could look
+    if blast.get("notIndexed") and blast.get("coverage", "none") == "none":
         org, repo = blast["sourceRepo"].split("/", 1)
         hints = blast.get("notIndexedHints") or []
         return validate_verdicts([{
@@ -143,11 +168,7 @@ def aggregate(blast: dict, test_results: list[dict] | None, manifest: dict | Non
     src_entry = teams.get(src_key)
     if src_entry and src_entry.get("isSourceRepo"):
         tr = trs.get(src_key)
-        verdict, reasoning, rule = decide(
-            {"confidence": "high",
-             "evidence": [{"source": "changeEvent", "detail": "the change was made in this repo"}]},
-            tr,
-        )
+        verdict, reasoning, rule = _decide_source(blast, tr)
         org, repo = blast["sourceRepo"].split("/", 1)
         out.append({
             "org": org, "repo": repo, "team": src_entry.get("team"),
@@ -161,7 +182,7 @@ def aggregate(blast: dict, test_results: list[dict] | None, manifest: dict | Non
                                  "detail": "the change was made in this repo",
                                  "matchedChangedCode": True}],
                 "testResult": tr and {k: tr.get(k) for k in (
-                    "status", "failedTests", "liveSignal", "liveIntegrationNote", "notRunReason")},
+                    "status", "failedTests", "liveSignal", "liveIntegrationNote", "notRunReason", "baseline")},
             },
         })
 

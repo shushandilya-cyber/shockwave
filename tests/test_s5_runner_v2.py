@@ -55,6 +55,94 @@ def test_skipped_only_from_user_flag(cfg):
     assert t["status"] == "NOT_RUN"
 
 
+def test_pipeline_not_run_reason_is_not_labelled_user_skip(cfg):
+    results = run_many([E_MAVEN], [], cfg, not_run="empty commit — nothing to test")
+    assert results[0]["status"] == "NOT_RUN" and "USER REQUESTED" not in (results[0]["notRunReason"] or "")
+
+
+def _report(root, cls, skipped=False):
+    d = root / "target/surefire-reports"
+    d.mkdir(parents=True, exist_ok=True)
+    body = "<skipped/>" if skipped else ""
+    (d / f"TEST-{cls}.xml").write_text(f'<testsuite tests="1"><testcase classname="{cls}" name="t">{body}</testcase></testsuite>')
+
+
+def test_live_signal_only_counts_tests_that_executed(tmp_path):
+    # INC-010: polis PolisApplicationIT names the service but surefire excludes **/*IT.java
+    from shockwave.stories.s5_runner import confirm_live, executed_test_classes
+    it = tmp_path / "src/test/java/a/PolisApplicationIT.java"
+    it.parent.mkdir(parents=True)
+    it.write_text('class PolisApplicationIT { String h = "polis.vip.qa.ebay.com"; }')
+    _report(tmp_path, "a.OtherTest")
+    signal, note = confirm_live(tmp_path, ["polis"], executed_test_classes(tmp_path))
+    assert signal == "NONE" and "did not execute" in note and "PolisApplicationIT" in note
+    _report(tmp_path, "a.PolisApplicationIT")
+    assert confirm_live(tmp_path, ["polis"], executed_test_classes(tmp_path))[0] == "LIVE"
+
+
+def test_skipped_testcases_do_not_count_as_executed(tmp_path):
+    from shockwave.stories.s5_runner import executed_test_classes
+    _report(tmp_path, "a.SkippedIT", skipped=True)
+    _report(tmp_path, "a.RanTest")
+    assert executed_test_classes(tmp_path) == {"RanTest"}
+
+
+def test_jdk_is_matched_exactly_then_closest_newer():
+    from shockwave.stories.s5_runner import pick_jdk
+    jdks = {8: "/j8", 17: "/j17", 21: "/j21", 26: "/j26"}
+    assert pick_jdk(8, jdks) == "/j8"
+    assert pick_jdk(11, jdks) == "/j17"
+    assert pick_jdk(27, jdks) is None
+
+
+def test_installed_jdks_parses_java_home_listing(monkeypatch):
+    import subprocess as sp
+    from shockwave.stories import s5_runner
+    listing = ('Matching Java Virtual Machines (2):\n'
+               '    26.0.1 (arm64) "Oracle Corporation" - "Java SE 26.0.1" /Library/Java/JavaVirtualMachines/jdk-26.jdk/Contents/Home\n'
+               '    1.8.0_481 (arm64) "Azul Systems, Inc." - "Zulu 8.91.0.12" /Library/Java/JavaVirtualMachines/zulu-8.jdk/Contents/Home\n'
+               '/Library/Java/JavaVirtualMachines/jdk-26.jdk/Contents/Home\n')
+    monkeypatch.setattr(s5_runner.subprocess, "run", lambda *a, **k: sp.CompletedProcess(a, 0, "", listing))
+    assert s5_runner.installed_jdks() == {26: "/Library/Java/JavaVirtualMachines/jdk-26.jdk/Contents/Home",
+                                          8: "/Library/Java/JavaVirtualMachines/zulu-8.jdk/Contents/Home"}
+
+
+# ── source repo is tested at the change; failures are baselined at the parent ────
+
+def test_source_repo_clone_is_checked_out_at_the_commit(cfg, tmp_path):
+    from conftest import git
+    from shockwave.stories.s5_runner import _clone
+    p = make_repo(cfg.local_repos_root, "pinned")
+    (p / "v.txt").write_text("old"); old = commit_all(p, "1")
+    (p / "v.txt").write_text("new"); commit_all(p, "2")
+    dest = tmp_path / "c"
+    how = _clone({"org": "TestOrg", "repo": "pinned", "commit": old}, dest, RepoSource(cfg))
+    assert (dest / "v.txt").read_text() == "old" and old[:8] in how
+    assert git(dest, "rev-parse", "HEAD").strip() == old
+
+
+def test_baseline_splits_pre_existing_from_new_failures():
+    from shockwave.stories.s5_runner import baseline_at_parent
+    seen = {}
+
+    def fake(entry, *a):
+        seen.update(entry)
+        return {"status": "FAIL", "failedTests": ["a.T#x"], "command": "mvn"}
+
+    r = {"status": "FAIL", "failedTests": ["a.T#x", "a.U#y"]}
+    bl = baseline_at_parent(r, E_MAVEN, "parentsha", [], runner=fake)
+    assert seen["commit"] == "parentsha" and seen["testFilter"] == ["a.T", "a.U"]
+    assert bl["preExisting"] == ["a.T#x"] and bl["newFailures"] == ["a.U#y"]
+
+
+def test_baseline_only_for_red_suites_with_a_parent():
+    from shockwave.stories.s5_runner import baseline_at_parent
+    boom = lambda *a: (_ for _ in ()).throw(AssertionError("must not run"))
+    assert baseline_at_parent({"status": "PASS", "failedTests": []}, E_MAVEN, "p", [], runner=boom) is None
+    assert baseline_at_parent({"status": "FAIL", "failedTests": ["a#b"]}, E_MAVEN, None, [], runner=boom) is None
+    assert baseline_at_parent({"status": "FAIL", "failedTests": ["a#b"]}, E_NPM, "p", [], runner=boom)["status"] == "NOT_RUN"
+
+
 # ── §3 Tri-state live signal ──────────────────────────────────────────────────────
 
 def test_live_signal_from_hostname(tmp_path):

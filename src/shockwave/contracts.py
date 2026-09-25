@@ -26,7 +26,9 @@ def _enum(val: Any, allowed: set, name: str) -> None:
 
 
 CONFIDENCE = {"high", "medium", "low"}
-EVIDENCE_SOURCES = {"graphSearch", "vectorSearch", "getRepoDependencies", "getOpenapiConnections", "localScan"}
+EVIDENCE_SOURCES = {"graphSearch", "vectorSearch", "getRepoDependencies", "getOpenapiConnections", "localScan",
+                    # local context index (context.py): call site, Maven dependency, HTTP client config
+                    "localCallSite", "localMavenDependency", "localHttpClient"}
 SYMBOL_KINDS = {"class", "method", "field", "endpoint"}
 CHANGE_TYPES = {"added", "modified", "removed"}
 BUILD_TOOLS = {"maven", "gradle", "npm", "unknown"}

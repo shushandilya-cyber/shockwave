@@ -16,6 +16,8 @@ _CLASS_RE = re.compile(r"\b(class|interface|enum|record)\s+([A-Za-z_$][\w$]*)")
 _ANNOT_DECL_RE = re.compile(r"@interface\s+([A-Za-z_$][\w$]*)")
 _PKG_RE = re.compile(r"^\s*package\s+([\w.]+)\s*;", re.M)
 _IDENT_BEFORE = re.compile(r"([A-Za-z_$][\w$]*)\s*$")
+# `@ApiRef(api = "x")` before a class: the `=` belongs to the annotation, not an assignment
+_ANNOT_ARGS = re.compile(r"@[\w.$]+\s*\((?:[^()]|\([^()]*\))*\)")
 _NOT_METHODS = {"if", "for", "while", "switch", "catch", "synchronized", "try", "else", "do", "new", "return",
                 "throw", "super", "this", "finally", "case", "default", "assert"}
 _HTTP_ANN = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
@@ -90,7 +92,8 @@ def _method_sig(header: str):
     if not m:
         return None
     name = m.group(1)
-    if name in _NOT_METHODS or "=" in before or "->" in before:
+    bare = _ANNOT_ARGS.sub("", before)
+    if name in _NOT_METHODS or "=" in bare or "->" in bare:
         return None
     # must look like a declaration: something precedes the name (type/modifier) or it's a constructor
     return name, re.sub(r"\s+", " ", h[k + 1:-1]).strip()
@@ -162,7 +165,7 @@ def outline(src: str) -> tuple[str, list[Decl]]:
             hs = header_start(seg_start, i)
             m_cls = _ANNOT_DECL_RE.search(header) or _CLASS_RE.search(header)
             is_top_or_class = not stack or stack[-1][0] == "class"
-            if m_cls and is_top_or_class and "=" not in header.split(m_cls.group(0))[0] and "new " not in header:
+            if m_cls and is_top_or_class and "=" not in _ANNOT_ARGS.sub("", header.split(m_cls.group(0))[0]) and "new " not in header:
                 name = m_cls.group(m_cls.lastindex)
                 d = Decl("class", cls_path(), name, line_of(hs), 0, annotations=src[seg_start:i])
                 decls.append(d); stack.append(("class", d))
@@ -187,7 +190,7 @@ def outline(src: str) -> tuple[str, list[Decl]]:
                     if sig and "=" not in header:
                         decls.append(Decl("method", cls_path(), sig[0], line_of(hs), line_of(i), params=_simplify_params(sig[1]), annotations=src[seg_start:i]))
                     else:
-                        lhs = header.split("=", 1)[0]
+                        lhs = _ANNOT_ARGS.sub("", header).split("=", 1)[0]
                         m = _IDENT_BEFORE.search(lhs.rstrip())
                         if m and m.group(1) not in _NOT_METHODS and len(lhs.split()) >= 2:
                             decls.append(Decl("field", cls_path(), m.group(1), line_of(hs), line_of(i)))

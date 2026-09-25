@@ -30,6 +30,10 @@ from ..contracts import validate_test_result
 
 _ENV_BASE = {
     "GIT_TERMINAL_PROMPT": "0",
+    # abort a transfer that stalls below 1 KB/s for 60s: subprocess timeouts use a clock that
+    # stops while the laptop sleeps, so a dead VPN connection otherwise hangs a clone for hours
+    "GIT_HTTP_LOW_SPEED_LIMIT": "1000",
+    "GIT_HTTP_LOW_SPEED_TIME": "60",
     "HOME": str(Path.home()),
     "PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin",
 }
@@ -69,6 +73,8 @@ def _result(entry: dict, **kw) -> dict:
         "discoveryEvidence": entry.get("discoveryEvidence") or [],
         # test classes that mention the changed service; used by the targeted run
         "targetedTestClasses": [],
+        # pinned SHA the suite ran at; None means the repo's default-branch tip
+        "commit": entry.get("commit"),
     }
     base.update(kw)
     # keep backward-compat bool in sync
@@ -87,9 +93,63 @@ def live_integration_scan(root: Path, source_apps: list[str]) -> tuple[str, str]
     MOCKED = integration-style test mentions the service name but mocks it.
     NONE   = no relevant tests found.
     """
+    live_hits, mocked_hits = _live_hits(root, source_apps)
+    if live_hits is None:
+        return "NONE", "source service app names unknown — this run is a generic sanity check only"
+    return _classify_live(live_hits, mocked_hits)
+
+
+def _classify_live(live_hits: list[str], mocked_hits: list[str]) -> tuple[str, str]:
+    if live_hits:
+        return "LIVE", f"tests reference the changed service live: {', '.join(sorted(live_hits)[:5])}"
+    if mocked_hits:
+        return "MOCKED", (
+            f"integration-style tests mention the service but mock it "
+            f"({', '.join(sorted(mocked_hits)[:3])}) — contract shape only"
+        )
+    return "NONE", "no tests referencing the changed service were found — generic sanity check only"
+
+
+def executed_test_classes(root: Path) -> set[str]:
+    """Simple names of test classes with at least one non-skipped testcase in the JUnit XML reports."""
+    out: set[str] = set()
+    for x in (list(root.rglob("target/surefire-reports/TEST-*.xml")) + list(root.rglob("target/failsafe-reports/TEST-*.xml"))
+              + list(root.rglob("build/test-results/**/TEST-*.xml"))):
+        try:
+            t = ET.parse(x).getroot()
+        except ET.ParseError:
+            continue
+        for tc in t.iter("testcase"):
+            if tc.find("skipped") is None and tc.get("classname"):
+                out.add(tc.get("classname").rsplit(".", 1)[-1].split("$")[0])
+    return out
+
+
+def confirm_live(root: Path, source_apps: list[str], executed: set[str]) -> tuple[str, str]:
+    """Live signal counting only test sources whose class actually ran.
+
+    A LIVE/MOCKED claim from a file that surefire excluded (e.g. ``*IT.java`` under ``mvn test``)
+    is evidence of nothing, so it must not decide a verdict.
+    """
+    live_hits, mocked_hits = _live_hits(root, source_apps)
+    if live_hits is None:
+        return "NONE", "source service app names unknown — this run is a generic sanity check only"
+    ran = lambda rel: Path(rel).suffix not in (".java", ".kt") or Path(rel).stem in executed
+    if not executed:
+        # no test ran at all, so config files under src/test prove nothing either
+        ran = lambda rel: False
+    live_run, mocked_run = [h for h in live_hits if ran(h)], [h for h in mocked_hits if ran(h)]
+    signal, note = _classify_live(live_run, mocked_run)
+    idle = sorted(set(live_hits + mocked_hits) - set(live_run + mocked_run))
+    if idle:
+        note += f"; not counted — these reference the service but did not execute in this run: {', '.join(idle[:3])}"
+    return signal, note
+
+
+def _live_hits(root: Path, source_apps: list[str]) -> tuple[list[str] | None, list[str]]:
     apps = sorted({a.lower() for a in source_apps if a and len(a) >= 4})
     if not apps:
-        return "NONE", "source service app names unknown — this run is a generic sanity check only"
+        return None, []
 
     esc = "|".join(map(re.escape, apps))
     host_rx = re.compile(_HOST_RX_TEMPLATE.format(apps=esc), re.I)
@@ -113,15 +173,7 @@ def live_integration_scan(root: Path, source_apps: list[str]) -> tuple[str, str]
             live_hits.append(rel)
         elif p.suffix in (".java", ".kt") and _IT_NAME.search(p.name) and name_rx.search(txt):
             (mocked_hits if _MOCK.search(txt) else live_hits).append(rel)
-
-    if live_hits:
-        return "LIVE", f"tests reference the changed service live: {', '.join(sorted(live_hits)[:5])}"
-    if mocked_hits:
-        return "MOCKED", (
-            f"integration-style tests mention the service but mock it "
-            f"({', '.join(sorted(mocked_hits)[:3])}) — contract shape only"
-        )
-    return "NONE", "no tests referencing the changed service were found — generic sanity check only"
+    return live_hits, mocked_hits
 
 
 def targeted_test_classes(root: Path, source_apps: list[str], max_classes: int = 25) -> list[str]:
@@ -224,7 +276,37 @@ def integration_test_entries(
 
 # ── Clone helper ──────────────────────────────────────────────────────────────────
 
+def _clone_at(entry: dict, dest: Path, rs: RepoSource) -> str:
+    """Temp clone checked out at entry['commit'] (local objects shared when a clone exists)."""
+    org, repo, sha = entry["org"], entry["repo"], entry["commit"]
+    local = rs.local_path(org, repo)
+    cached = rs.cfg.cache_dir / "clones" / org / repo
+    src = str(local) if local else (str(cached) if (cached / ".git").exists() or (cached / "HEAD").exists() else None)
+    if src:
+        r = subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout", src, str(dest)],
+                           capture_output=True, text=True, timeout=600, env=_ENV_BASE)
+        how = f"local @ {sha[:8]}"
+    else:
+        r = subprocess.run(["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout",
+                            rs.remote_url(org, repo), str(dest)], capture_output=True, text=True, timeout=900, env=_ENV_BASE)
+        how = f"remote @ {sha[:8]}"
+    if r.returncode != 0:
+        raise RuntimeError(f"{_classify_clone_error(r.stderr)}: {r.stderr.strip()[:300]}")
+    co = subprocess.run(["git", "-C", str(dest), "checkout", "--quiet", "--detach", sha],
+                        capture_output=True, text=True, timeout=600, env=_ENV_BASE)
+    if co.returncode != 0:
+        subprocess.run(["git", "-C", str(dest), "fetch", "--quiet", rs.remote_url(org, repo), sha],
+                       capture_output=True, text=True, timeout=900, env=_ENV_BASE)
+        co = subprocess.run(["git", "-C", str(dest), "checkout", "--quiet", "--detach", sha],
+                            capture_output=True, text=True, timeout=600, env=_ENV_BASE)
+        if co.returncode != 0:
+            raise RuntimeError(f"commit {sha[:12]} not found in {org}/{repo}: {co.stderr.strip()[:200]}")
+    return how
+
+
 def _clone(entry: dict, dest: Path, rs: RepoSource) -> str:
+    if entry.get("commit"):
+        return _clone_at(entry, dest, rs)
     org, repo, br = entry["org"], entry["repo"], entry.get("defaultBranch")
     args = ["git", "clone", "--depth", "1", "--quiet"] + (["--branch", br] if br else [])
     r = subprocess.run(
@@ -306,8 +388,31 @@ def _java_home(root: Path) -> str | None:
     )
     if not m:
         return None
-    r = subprocess.run(["/usr/libexec/java_home", "-v", m.group(1)], capture_output=True, text=True)
-    return (r.stdout.strip() or None) if r.returncode == 0 else None
+    return pick_jdk(int(m.group(1)), installed_jdks())
+
+
+def installed_jdks() -> dict[int, str]:
+    """{major: JAVA_HOME} from ``java_home -V``."""
+    try:
+        r = subprocess.run(["/usr/libexec/java_home", "-V"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return {}
+    out: dict[int, str] = {}
+    for ln in (r.stderr + r.stdout).splitlines():
+        m = re.match(r"\s+(?:1\.)?(\d+)[.\d_]*\s.*\s(/\S.*)$", ln)
+        if m:
+            out.setdefault(int(m.group(1)), m.group(2).strip())
+    return out
+
+
+def pick_jdk(major: int, jdks: dict[int, str]) -> str | None:
+    # `java_home -v 8` and `-v <missing>` both return the newest JDK, which compiles Java 8
+    # code but breaks Mockito/ASM-era test stacks — so match the major exactly, else the
+    # closest newer one.
+    if major in jdks:
+        return jdks[major]
+    newer = sorted(v for v in jdks if v > major)
+    return jdks[newer[0]] if newer else None
 
 
 # ── Gradle helpers ────────────────────────────────────────────────────────────────
@@ -469,7 +574,10 @@ def run_one(
             if jh:
                 env["JAVA_HOME"] = jh
             cmd = (entry.get("testCommand") or "mvn -B test").split()
-            if cfg.targeted_tests and targeted:
+            if entry.get("testFilter"):
+                cmd += [f"-Dtest={','.join(entry['testFilter'])}", "-Dsurefire.failIfNoSpecifiedTests=false",
+                        "-DfailIfNoTests=false"]
+            elif cfg.targeted_tests and targeted:
                 cmd += [f"-Dtest={','.join(targeted)}", "-DfailIfNoTests=false"]
             failed, run, status, timed_out, code, log = _run_cmd(
                 cmd, dest, work, env, cfg.test_timeout_seconds
@@ -479,6 +587,7 @@ def run_one(
                 nr = f"mvn timed out after {cfg.test_timeout_seconds}s"
             else:
                 failed, run = parse_surefire(dest)
+                live_signal, live_note = confirm_live(dest, source_apps, executed_test_classes(dest))
                 nr = None
                 if failed:
                     status = "FAIL"
@@ -510,6 +619,8 @@ def run_one(
                     integrationTestRepos=it_repos, clonedFrom=how,
                 )
             cmd = (entry.get("testCommand") or "./gradlew test --no-daemon").split()
+            for c in entry.get("testFilter") or []:
+                cmd += ["--tests", c]
             failed, run, status, timed_out, code, log = _run_cmd(
                 cmd, dest, work, env, cfg.test_timeout_seconds
             )
@@ -524,6 +635,7 @@ def run_one(
             gradle_failed, gradle_run = parse_gradle_results(dest)
             if gradle_run:
                 failed, run = gradle_failed, gradle_run
+            live_signal, live_note = confirm_live(dest, source_apps, executed_test_classes(dest))
             nr = None
             if failed:
                 final_status = "FAIL"
@@ -630,6 +742,30 @@ def _static_live_signal(rs: RepoSource, entry: dict, source_apps: list[str]) -> 
     }
 
 
+# ── Parent baseline ───────────────────────────────────────────────────────────────
+
+def baseline_at_parent(result: dict, entry: dict, parent: str | None, source_apps: list[str],
+                       cfg: Config = CONFIG, runner=None) -> dict | None:
+    """Re-run the changed repo's failing test classes at the parent commit.
+
+    A test that also fails at the parent was already broken; one that passes there and fails
+    here was broken by this commit. Without this, every red suite reads "may be unrelated".
+    """
+    if not parent or result.get("status") != "FAIL" or not result.get("failedTests"):
+        return None
+    classes = sorted({t.split("#", 1)[0] for t in result["failedTests"] if t})
+    if entry.get("buildTool") not in ("maven", "gradle"):
+        return {"commit": parent, "status": "NOT_RUN", "testClasses": classes,
+                "reason": f"parent baseline not supported for build tool {entry.get('buildTool')!r}"}
+    r = (runner or run_one)({**entry, "commit": parent, "testFilter": classes}, source_apps, RepoSource(cfg), cfg)
+    out = {"commit": parent, "status": r["status"], "testClasses": classes, "command": r.get("command"),
+           "clonedFrom": r.get("clonedFrom")}
+    if r["status"] not in ("PASS", "FAIL"):
+        return {**out, "reason": r.get("notRunReason") or "baseline run did not produce test results"}
+    before, after = set(r.get("failedTests") or []), set(result["failedTests"])
+    return {**out, "preExisting": sorted(after & before), "newFailures": sorted(after - before)}
+
+
 # ── Batch runner ──────────────────────────────────────────────────────────────────
 
 def run_many(
@@ -638,12 +774,14 @@ def run_many(
     cfg: Config = CONFIG,
     skip: str | None = None,
     source_repo: str | None = None,
+    not_run: str | None = None,
 ) -> list[dict]:
     """Run tests for a list of manifest entries, plus any discovered integration-test repos.
 
     ``skip`` is ONLY accepted when the user explicitly passed --skip-tests. In that case
     all entries get status=SKIPPED with the skip reason. Otherwise every entry is
-    attempted and any non-execution is NOT_RUN with a specific reason.
+    attempted and any non-execution is NOT_RUN with a specific reason; ``not_run`` gives
+    that reason for the whole batch when the pipeline itself knows running is pointless.
 
     Integration-test repos (§3) are discovered once here rather than per entry: the scan
     covers every local clone and its answer does not depend on which consumer is running.
@@ -656,6 +794,10 @@ def run_many(
     discovered = discover_integration_test_repos(rs, source_apps, exclude)
     it_keys = [d["key"] for d in discovered]
 
+    if not_run:
+        return [_result(e, status="NOT_RUN", notRunReason=not_run, integrationTestRepos=it_keys,
+                        **_static_live_signal(rs, e, source_apps))
+                for e in entries]
     if skip:
         # §3: SKIPPED only on explicit user request, and prominently labelled. The live
         # signal is still computed from the local clone — "we didn't run the tests" is no

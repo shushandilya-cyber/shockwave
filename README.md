@@ -35,7 +35,10 @@ $S jira    --in /tmp/sw/06.json --blast /tmp/sw/03.json --event /tmp/sw/01.json 
 End to end: `$S run --org CoreShipping --repo waypointservice --commit 9d60af39 [--skip-tests] [--only-repo org/repo] [--create-jira --project TST]`
 writes `runs/<id>/01..07-*.json` plus `report.md`.
 
-Backtest against recorded incidents: `$S backtest --incidents incidents.yaml [--run-tests]` → `docs/backtest/pudo-incidents.md`.
+Backtest against recorded incidents: `$S backtest --incidents incidents.yaml [--run-tests] [--source-tests-only] [--only INC-006 ...] [--doc path.md]`
+→ `docs/backtest/pudo-incidents.md`. Incidents may declare `catch_signals` (e.g. `environmentGap:Sandbox`,
+`sourceTestsFail`); an incident counts as *caught* only when one of those signals fires, so a lucky flag for the
+wrong reason doesn't count.
 
 ## Tests
 ```bash
@@ -103,6 +106,40 @@ The live-integration signal is tri-state and is **always** computed, even when t
 Dedicated integration-test repos (e.g. `Ship-AST/PudoIntegrationTests`) are discovered by scanning local clones
 for the source's staging hosts, and are **run**, not merely listed. The source repo itself is also evaluated:
 Story 3 is downstream-only, so without that the changed repo would be the one repo whose tests never run.
+
+The source repo is tested **at the analysed commit** (`TestResult.commit`), and consumers at their default
+branch. When the source suite is red, the failing classes are re-run at the parent commit (`TestResult.baseline`),
+which separates failures the commit introduced from failures that were already there (for example, a timezone-
+dependent assertion that fails on any machine outside UTC). That gives the source repo three extra verdict rules:
+
+| Rule | Condition | Verdict |
+|---|---|---|
+| 0 | empty commit: tree identical to parent | NotImpacted (tests `NOT_RUN`, nothing to test) |
+| 8 | every failure also fails at the parent | decided as if the suite passed, reasoning says "pre-existing" |
+| 9 | at least one failure is new relative to the parent | Impacted |
+
+An inconclusive baseline (build failed at the parent, non-JVM repo) leaves rule 5 in place.
+
+## Environment-profile gaps (Story 2)
+Moving from legacy `META-INF/configuration/<Env>/` to `application-<Env>.properties|yml` is a common source of
+"works in QA, dead in Sandbox". Story 2 flags a module that has profile files and a legacy `<Env>` directory but
+no profile for that `<Env>`. Only gaps **introduced by this commit** (not present at the parent) are reported, as a
+BREAKING `breakingChanges` entry with `kind: "environment"`, because every caller in that environment is affected.
+
+## Local context index
+`~/.cache/shockwave/context` holds a read-only index of every repo under `~/Documents/projects` (artifacts,
+dependencies, HTTP clients, call sites). Story 3 merges it with the Code Knowledge graph and records which sources
+answered in `coverage`: `graph+local`, `graph`, `local`, or `none`. `none` means UNKNOWN, never "no impact".
+
+## Portal (`shockwave serve`)
+```bash
+.venv/bin/shockwave serve --port 8765     # http://127.0.0.1:8765
+```
+Enter a repo (`org/repo`, a GitHub URL, a unique bare name, or an alias: `punotif`, `pickupeligibility`,
+`pickupsvc`, `cls`, `polis`) and optionally a commit and branch (blank commit = branch tip). A repo that isn't
+cloned locally is cloned into the cache and indexed first, then the full S1–S7 pipeline runs with Jira in dry-run.
+Jobs run one at a time and persist under `runs/portal/<id>/`; the page shows stage progress, the summary and
+the rendered report. API: `POST /api/runs`, `GET /api/runs[/<id>[/report]]`, `GET /api/repos`.
 
 ## Incident backtest (`docs/backtest/pudo-incidents.md`)
 Each incident in `incidents.yaml` is replayed at its culprit commit (read-only, Jira dry-run) and scored for
